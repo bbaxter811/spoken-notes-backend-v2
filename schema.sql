@@ -161,7 +161,7 @@ GRANT SELECT ON public.user_storage_usage TO authenticated;
 -- ============================================================================
 -- USER SUBSCRIPTIONS TABLE (for Stripe webhook writes)
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS user_subscriptions (
+CREATE TABLE IF NOT EXISTS subscriptions (
   user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
   
   -- Stripe identifiers
@@ -182,14 +182,14 @@ CREATE TABLE IF NOT EXISTS user_subscriptions (
 );
 
 -- Index for lookups by Stripe IDs
-CREATE INDEX IF NOT EXISTS idx_user_subscriptions_stripe_customer ON user_subscriptions(stripe_customer_id);
-CREATE INDEX IF NOT EXISTS idx_user_subscriptions_stripe_subscription ON user_subscriptions(stripe_subscription_id);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_customer ON subscriptions(stripe_customer_id);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_stripe_subscription ON subscriptions(stripe_subscription_id);
 
 -- RLS policies
-ALTER TABLE user_subscriptions ENABLE ROW LEVEL SECURITY;
+ALTER TABLE subscriptions ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY "Users can view their own subscription"
-  ON user_subscriptions FOR SELECT
+  ON subscriptions FOR SELECT
   USING (auth.uid() = user_id);
 
 -- Note: Only backend (service role) can INSERT/UPDATE subscriptions (from webhooks)
