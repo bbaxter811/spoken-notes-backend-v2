@@ -24,9 +24,67 @@ const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 const { v4: uuidv4 } = require('uuid');
+const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
+
+// CRITICAL: Raw body for Stripe webhooks (must be before express.json())
+app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  const sig = req.headers['stripe-signature'];
+  const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
+
+  if (!webhookSecret) {
+    console.error('❌ STRIPE_WEBHOOK_SECRET not set');
+    return res.status(500).json({ error: 'Webhook secret not configured' });
+  }
+
+  let event;
+
+  try {
+    event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
+    console.log(`✅ Stripe webhook received: ${event.type}`);
+  } catch (err) {
+    console.error(`❌ Webhook signature verification failed: ${err.message}`);
+    return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // Handle different event types
+  switch (event.type) {
+    case 'checkout.session.completed':
+      console.log('💳 Checkout session completed:', event.data.object.id);
+      // TODO: Update user subscription tier in database
+      break;
+
+    case 'customer.subscription.created':
+      console.log('📝 Subscription created:', event.data.object.id);
+      break;
+
+    case 'customer.subscription.updated':
+      console.log('🔄 Subscription updated:', event.data.object.id);
+      break;
+
+    case 'customer.subscription.deleted':
+      console.log('❌ Subscription deleted:', event.data.object.id);
+      break;
+
+    case 'invoice.payment_succeeded':
+      console.log('✅ Payment succeeded:', event.data.object.id);
+      break;
+
+    case 'invoice.payment_failed':
+      console.log('💸 Payment failed:', event.data.object.id);
+      break;
+
+    default:
+      console.log(`⚠️ Unhandled event type: ${event.type}`);
+  }
+
+  res.json({ received: true });
+});
+
+// JSON parsing for all other routes
+app.use(express.json());
 
 // Initialize Supabase client (admin for server-side operations)
 let supabaseAdmin;
@@ -60,9 +118,8 @@ const upload = multer({
   }
 });
 
-// Middleware
+// CORS middleware
 app.use(cors());
-app.use(express.json());
 
 // Auth middleware
 const authenticateUser = async (req, res, next) => {
@@ -176,6 +233,31 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
     const recordingId = uuidv4();
 
     console.log(`📤 Uploading recording for user ${userId}, duration: ${duration}s, size: ${req.file.size} bytes`);
+
+    // PHASE 3: Storage limit enforcement (server-side check)
+    const capBytes = parseInt(process.env.STORAGE_CAP_BYTES) || 262144000; // 250 MB default
+
+    const { data: usageData, error: usageError } = await supabaseAdmin
+      .from('user_storage_usage')
+      .select('total_bytes')
+      .eq('user_id', userId)
+      .single();
+
+    const currentUsage = usageData?.total_bytes || 0;
+    const newTotal = currentUsage + req.file.size;
+
+    if (newTotal > capBytes) {
+      console.log(`🚫 Storage limit exceeded: ${newTotal} > ${capBytes} bytes`);
+      return res.status(402).json({
+        code: 'STORAGE_LIMIT',
+        error: 'Storage limit exceeded',
+        total_bytes: currentUsage,
+        cap_bytes: capBytes,
+        upload_size: req.file.size
+      });
+    }
+
+    console.log(`✅ Storage check passed: ${newTotal} / ${capBytes} bytes`);
 
     // 1. Upload audio to Supabase Storage
     const fileName = `${recordingId}-${Date.now()}.${req.file.originalname.split('.').pop()}`;
@@ -847,6 +929,74 @@ app.post('/api/tts', authenticateUser, async (req, res) => {
       error: 'Failed to generate speech',
       message: error.message
     });
+  }
+});
+
+// ============================================================================
+// BILLING/METERING ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /api/billing/usage
+ * Returns current storage usage for the authenticated user
+ * Reads from user_storage_usage view (combines audio + text bytes)
+ */
+app.get('/api/billing/usage', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const capBytes = parseInt(process.env.STORAGE_CAP_BYTES) || 262144000; // 250 MB default
+
+    console.log(`📊 Storage usage request from user ${userId}`);
+
+    // Query the user_storage_usage view
+    const { data, error } = await supabaseAdmin
+      .from('user_storage_usage')
+      .select('*')
+      .eq('user_id', userId)
+      .single();
+
+    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows (user has no uploads yet)
+      console.error('❌ Database query error:', error);
+      return res.status(500).json({ error: 'Failed to fetch storage usage' });
+    }
+
+    // If no data, user has 0 bytes used
+    const totalBytes = data?.total_bytes || 0;
+    const audioBytes = data?.audio_bytes || 0;
+    const textBytes = data?.text_bytes || 0;
+
+    const percentUsed = Math.round((totalBytes / capBytes) * 100);
+
+    // Determine alert level
+    let alertLevel = 'none';
+    if (percentUsed >= 100) {
+      alertLevel = 'blocked';
+    } else if (percentUsed >= 90) {
+      alertLevel = 'critical';
+    } else if (percentUsed >= 70) {
+      alertLevel = 'warning';
+    }
+
+    const usage = {
+      total_bytes: totalBytes,
+      audio_bytes: audioBytes,
+      text_bytes: textBytes,
+      cap_bytes: capBytes,
+      percent_used: percentUsed,
+      alert_level: alertLevel,
+      tier: 'free' // TODO: Read from user subscription table when implemented
+    };
+
+    console.log(`✅ Usage: ${totalBytes} / ${capBytes} bytes (${percentUsed}%)`);
+
+    res.json({
+      success: true,
+      usage
+    });
+
+  } catch (err) {
+    console.error('❌ Billing usage error:', err);
+    res.status(500).json({ error: 'Failed to fetch storage usage' });
   }
 });
 

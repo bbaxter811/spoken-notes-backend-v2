@@ -115,3 +115,45 @@ CREATE POLICY "Users can update their own preferences"
 -- CREATE POLICY "Users can delete their own recordings"
 --   ON storage.objects FOR DELETE
 --   USING (bucket_id = 'recordings' AND auth.uid()::text = (storage.foldername(name))[1]);
+
+-- ============================================================================
+-- STORAGE METERING VIEWS (for billing/alerting)
+-- ============================================================================
+
+-- View 1: Audio bytes per user (from Supabase Storage)
+CREATE OR REPLACE VIEW public.user_audio_usage AS
+SELECT 
+  (regexp_match(name, '^([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/.*'))[1]::uuid AS user_id,
+  SUM((metadata->>'size')::bigint) AS audio_bytes
+FROM storage.objects
+WHERE 
+  bucket_id = 'recordings'
+  AND name ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/.*'
+GROUP BY user_id;
+
+-- View 2: Text bytes per user (transcriptions + summaries in DB)
+CREATE OR REPLACE VIEW public.user_text_usage AS
+SELECT 
+  user_id,
+  SUM(
+    COALESCE(octet_length(transcription), 0) + 
+    COALESCE(octet_length(summary), 0)
+  ) AS text_bytes
+FROM recordings
+WHERE status = 'completed'
+GROUP BY user_id;
+
+-- View 3: Combined storage (single source of truth)
+CREATE OR REPLACE VIEW public.user_storage_usage AS
+SELECT 
+  COALESCE(a.user_id, t.user_id) AS user_id,
+  COALESCE(a.audio_bytes, 0) AS audio_bytes,
+  COALESCE(t.text_bytes, 0) AS text_bytes,
+  COALESCE(a.audio_bytes, 0) + COALESCE(t.text_bytes, 0) AS total_bytes
+FROM user_audio_usage a
+FULL OUTER JOIN user_text_usage t ON a.user_id = t.user_id;
+
+-- Grant select access to authenticated users (for /api/billing/usage endpoint)
+GRANT SELECT ON public.user_audio_usage TO authenticated;
+GRANT SELECT ON public.user_text_usage TO authenticated;
+GRANT SELECT ON public.user_storage_usage TO authenticated;
