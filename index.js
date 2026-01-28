@@ -68,30 +68,173 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
   // Handle different event types
   switch (event.type) {
-    case 'checkout.session.completed':
-      console.log('💳 Checkout session completed:', event.data.object.id);
-      // TODO: Update user subscription tier in database
+    case 'checkout.session.completed': {
+      const session = event.data.object;
+      console.log('💳 Checkout session completed:', session.id);
+      console.log('   Customer ID:', session.customer);
+      console.log('   Subscription ID:', session.subscription);
+      console.log('   Client Reference ID:', session.client_reference_id); // This should be user_id
+      
+      const userId = session.client_reference_id; // App must pass user_id here
+      
+      if (!userId) {
+        console.error('❌ No client_reference_id - cannot map to user');
+        break;
+      }
+      
+      // Update user subscription status
+      try {
+        const { data, error } = await supabaseAdmin
+          .from('user_subscriptions')
+          .upsert({
+            user_id: userId,
+            stripe_customer_id: session.customer,
+            stripe_subscription_id: session.subscription,
+            status: 'active',
+            updated_at: new Date().toISOString()
+          }, {
+            onConflict: 'user_id'
+          });
+        
+        if (error) {
+          console.error('❌ Failed to write subscription to Supabase:', error);
+        } else {
+          console.log('✅ Subscription written to Supabase for user:', userId);
+        }
+      } catch (err) {
+        console.error('❌ Supabase write error:', err);
+      }
       break;
+    }
 
-    case 'customer.subscription.created':
-      console.log('📝 Subscription created:', event.data.object.id);
+    case 'customer.subscription.created': {
+      const subscription = event.data.object;
+      console.log('📝 Subscription created:', subscription.id);
+      console.log('   Customer ID:', subscription.customer);
+      console.log('   Status:', subscription.status);
+      console.log('   Metadata:', JSON.stringify(subscription.metadata));
+      
+      const userId = subscription.metadata?.user_id; // Check metadata for user_id
+      
+      if (!userId) {
+        console.error('❌ No metadata.user_id - cannot map to user');
+        break;
+      }
+      
+      try {
+        const { data, error } = await supabaseAdmin
+          .from('user_subscriptions')
+          .upsert({
+            user_id: userId,
+            stripe_customer_id: subscription.customer,
+            stripe_subscription_id: subscription.id,
+            status: subscription.status,
+            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+            updated_at: new Date().toISOString()
+          }, {
+            onConflict: 'user_id'
+          });
+        
+        if (error) {
+          console.error('❌ Failed to write subscription:', error);
+        } else {
+          console.log('✅ Subscription created in Supabase for user:', userId);
+        }
+      } catch (err) {
+        console.error('❌ Supabase write error:', err);
+      }
       break;
+    }
 
-    case 'customer.subscription.updated':
-      console.log('🔄 Subscription updated:', event.data.object.id);
+    case 'customer.subscription.updated': {
+      const subscription = event.data.object;
+      console.log('🔄 Subscription updated:', subscription.id);
+      console.log('   Status:', subscription.status);
+      
+      try {
+        const { data, error } = await supabaseAdmin
+          .from('user_subscriptions')
+          .update({
+            status: subscription.status,
+            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+            updated_at: new Date().toISOString()
+          })
+          .eq('stripe_subscription_id', subscription.id);
+        
+        if (error) {
+          console.error('❌ Failed to update subscription:', error);
+        } else {
+          console.log('✅ Subscription updated in Supabase');
+        }
+      } catch (err) {
+        console.error('❌ Supabase write error:', err);
+      }
       break;
+    }
 
-    case 'customer.subscription.deleted':
-      console.log('❌ Subscription deleted:', event.data.object.id);
+    case 'customer.subscription.deleted': {
+      const subscription = event.data.object;
+      console.log('❌ Subscription deleted:', subscription.id);
+      
+      try {
+        const { data, error } = await supabaseAdmin
+          .from('user_subscriptions')
+          .update({
+            status: 'canceled',
+            updated_at: new Date().toISOString()
+          })
+          .eq('stripe_subscription_id', subscription.id);
+        
+        if (error) {
+          console.error('❌ Failed to mark subscription as canceled:', error);
+        } else {
+          console.log('✅ Subscription marked as canceled in Supabase');
+        }
+      } catch (err) {
+        console.error('❌ Supabase write error:', err);
+      }
       break;
+    }
 
-    case 'invoice.payment_succeeded':
-      console.log('✅ Payment succeeded:', event.data.object.id);
+    case 'invoice.payment_succeeded': {
+      const invoice = event.data.object;
+      console.log('✅ Payment succeeded:', invoice.id);
+      console.log('   Customer:', invoice.customer);
+      console.log('   Subscription:', invoice.subscription);
+      console.log('   Amount:', invoice.amount_paid / 100, invoice.currency.toUpperCase());
       break;
+    }
 
-    case 'invoice.payment_failed':
-      console.log('💸 Payment failed:', event.data.object.id);
+    case 'invoice.payment_failed': {
+      const invoice = event.data.object;
+      console.log('💸 Payment failed:', invoice.id);
+      console.log('   Customer:', invoice.customer);
+      console.log('   Subscription:', invoice.subscription);
+      
+      // Mark subscription as past_due
+      if (invoice.subscription) {
+        try {
+          const { data, error } = await supabaseAdmin
+            .from('user_subscriptions')
+            .update({
+              status: 'past_due',
+              updated_at: new Date().toISOString()
+            })
+            .eq('stripe_subscription_id', invoice.subscription);
+          
+          if (error) {
+            console.error('❌ Failed to update subscription status:', error);
+          } else {
+            console.log('✅ Subscription marked as past_due');
+          }
+        } catch (err) {
+          console.error('❌ Supabase write error:', err);
+        }
+      }
       break;
+    }
 
     default:
       console.log(`⚠️ Unhandled event type: ${event.type}`);
@@ -113,6 +256,7 @@ try {
     process.env.SUPABASE_SERVICE_ROLE_KEY
   );
   console.log('✅ Supabase client initialized');
+  console.log(`📍 Supabase URL: ${process.env.SUPABASE_URL}`); // Log URL for verification
 } catch (err) {
   console.error('⚠️  Supabase initialization warning:', err.message);
 }

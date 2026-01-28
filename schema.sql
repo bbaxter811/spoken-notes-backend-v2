@@ -157,3 +157,39 @@ FULL OUTER JOIN user_text_usage t ON a.user_id = t.user_id;
 GRANT SELECT ON public.user_audio_usage TO authenticated;
 GRANT SELECT ON public.user_text_usage TO authenticated;
 GRANT SELECT ON public.user_storage_usage TO authenticated;
+
+-- ============================================================================
+-- USER SUBSCRIPTIONS TABLE (for Stripe webhook writes)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS user_subscriptions (
+  user_id UUID PRIMARY KEY REFERENCES auth.users(id) ON DELETE CASCADE,
+  
+  -- Stripe identifiers
+  stripe_customer_id TEXT,
+  stripe_subscription_id TEXT UNIQUE,
+  
+  -- Subscription details
+  status TEXT NOT NULL DEFAULT 'free' CHECK (status IN ('free', 'active', 'past_due', 'canceled', 'trialing')),
+  tier TEXT DEFAULT 'free' CHECK (tier IN ('free', 'pro', 'premium')),
+  
+  -- Billing period
+  current_period_start TIMESTAMPTZ,
+  current_period_end TIMESTAMPTZ,
+  
+  -- Timestamps
+  created_at TIMESTAMPTZ DEFAULT NOW(),
+  updated_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+-- Index for lookups by Stripe IDs
+CREATE INDEX IF NOT EXISTS idx_user_subscriptions_stripe_customer ON user_subscriptions(stripe_customer_id);
+CREATE INDEX IF NOT EXISTS idx_user_subscriptions_stripe_subscription ON user_subscriptions(stripe_subscription_id);
+
+-- RLS policies
+ALTER TABLE user_subscriptions ENABLE ROW LEVEL SECURITY;
+
+CREATE POLICY "Users can view their own subscription"
+  ON user_subscriptions FOR SELECT
+  USING (auth.uid() = user_id);
+
+-- Note: Only backend (service role) can INSERT/UPDATE subscriptions (from webhooks)
