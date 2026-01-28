@@ -1098,6 +1098,57 @@ app.post('/api/tts', authenticateUser, async (req, res) => {
 // ============================================================================
 
 /**
+ * POST /api/billing/create-checkout
+ * Creates a Stripe Checkout Session for subscription purchase
+ * CRITICAL: Sets client_reference_id = user_id for webhook mapping
+ */
+app.post('/api/billing/create-checkout', authenticateUser, async (req, res) => {
+  try {
+    if (!stripe) {
+      return res.status(503).json({ error: 'Stripe not configured' });
+    }
+
+    const userId = req.user.id;
+    const { priceId, successUrl, cancelUrl } = req.body;
+
+    if (!priceId) {
+      return res.status(400).json({ error: 'priceId is required' });
+    }
+
+    console.log(`💳 Creating Checkout Session for user ${userId}, price: ${priceId}`);
+
+    // Create Checkout Session with client_reference_id = user_id
+    const session = await stripe.checkout.sessions.create({
+      mode: 'subscription',
+      payment_method_types: ['card'],
+      line_items: [{
+        price: priceId,
+        quantity: 1,
+      }],
+      success_url: successUrl || `${process.env.APP_URL || 'https://yourapp.com'}/success?session_id={CHECKOUT_SESSION_ID}`,
+      cancel_url: cancelUrl || `${process.env.APP_URL || 'https://yourapp.com'}/cancel`,
+      client_reference_id: userId, // ← CRITICAL: Maps Stripe customer to app user
+      customer_email: req.user.email, // Pre-fill email
+      metadata: {
+        user_id: userId // Backup mapping
+      }
+    });
+
+    console.log(`✅ Checkout Session created: ${session.id}`);
+
+    res.json({
+      success: true,
+      sessionId: session.id,
+      url: session.url // Frontend redirects user to this URL
+    });
+
+  } catch (err) {
+    console.error('❌ Checkout Session creation error:', err);
+    res.status(500).json({ error: 'Failed to create checkout session', message: err.message });
+  }
+});
+
+/**
  * GET /api/billing/usage
  * Returns current storage usage for the authenticated user
  * Reads from user_storage_usage view (combines audio + text bytes)
