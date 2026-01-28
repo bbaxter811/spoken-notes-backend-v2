@@ -24,13 +24,30 @@ const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 const { v4: uuidv4 } = require('uuid');
-const stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 
+// Initialize Stripe only if key is present (optional for deployment)
+let stripe = null;
+if (process.env.STRIPE_SECRET_KEY) {
+  try {
+    stripe = require('stripe')(process.env.STRIPE_SECRET_KEY);
+    console.log('✅ Stripe initialized');
+  } catch (err) {
+    console.error('⚠️ Stripe initialization failed:', err.message);
+  }
+} else {
+  console.log('⚠️ STRIPE_SECRET_KEY not set - Stripe disabled');
+}
+
 // CRITICAL: Raw body for Stripe webhooks (must be before express.json())
 app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (req, res) => {
+  if (!stripe) {
+    console.error('❌ Stripe not initialized (missing STRIPE_SECRET_KEY)');
+    return res.status(503).json({ error: 'Stripe not configured' });
+  }
+
   const sig = req.headers['stripe-signature'];
   const webhookSecret = process.env.STRIPE_WEBHOOK_SECRET;
 
