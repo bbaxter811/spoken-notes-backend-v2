@@ -163,37 +163,77 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       console.log('📝 customer.subscription.created:', subscription.id);
       console.log('   Customer ID:', subscription.customer);
       console.log('   Status:', subscription.status);
-      console.log('   Period start:', subscription.current_period_start);
-      console.log('   Period end:', subscription.current_period_end);
+      console.log('   Period start (raw):', subscription.current_period_start);
+      console.log('   Period end (raw):', subscription.current_period_end);
       
-      // Try to find user_id by stripe_customer_id (may have been created in checkout.session.completed)
+      // CRITICAL: Access fields from raw event data object
+      const periodStart = subscription.current_period_start;
+      const periodEnd = subscription.current_period_end;
+      
+      console.log('🔍 Timestamp check:', { 
+        periodStart, 
+        periodEnd,
+        hasStart: periodStart !== undefined,
+        hasEnd: periodEnd !== undefined,
+        typeof_start: typeof periodStart,
+        typeof_end: typeof periodEnd
+      });
+      
+      // Try to find user_id by looking up stripe_customer_id OR from checkout session
       let userId = subscription.metadata?.user_id;
       
       if (!userId) {
         console.log('⚠️ No metadata.user_id - attempting to find via stripe_customer_id');
+        
+        // First try: Look for existing subscription with this customer
         try {
-          const { data: existingUser, error: lookupError } = await supabaseAdmin
+          const { data: existingRows, error: lookupError } = await supabaseAdmin
             .from('subscriptions')
             .select('user_id')
             .eq('stripe_customer_id', subscription.customer)
-            .single();
+            .limit(1);
           
-          if (existingUser) {
-            userId = existingUser.user_id;
+          if (existingRows && existingRows.length > 0) {
+            userId = existingRows[0].user_id;
             console.log('✅ Found user_id via customer lookup:', userId);
-          } else {
-            console.warn('⚠️ Could not find user_id - skipping this event');
-            break;
           }
         } catch (lookupErr) {
-          console.error('❌ User lookup failed:', lookupErr.message);
+          console.error('❌ Customer lookup error:', lookupErr.message);
+        }
+        
+        // Second try: Query Stripe for the most recent checkout session with this customer
+        if (!userId) {
+          console.log('⚠️ Attempting to find userId via Stripe checkout sessions');
+          try {
+            const sessions = await stripe.checkout.sessions.list({
+              customer: subscription.customer,
+              limit: 1
+            });
+            
+            if (sessions.data.length > 0 && sessions.data[0].client_reference_id) {
+              userId = sessions.data[0].client_reference_id;
+              console.log('✅ Found user_id via checkout session:', userId);
+            }
+          } catch (stripeErr) {
+            console.error('❌ Stripe session lookup error:', stripeErr.message);
+          }
+        }
+        
+        if (!userId) {
+          console.warn('⚠️ Could not find user_id - skipping this event');
           break;
         }
       }
       
-      const priceId = subscription.items.data[0]?.price.id || null;
+      const priceId = subscription.items?.data?.[0]?.price?.id || null;
       
       try {
+        // Validate timestamps exist
+        if (!periodStart || !periodEnd) {
+          console.error('❌ Missing timestamps even after extraction:', { periodStart, periodEnd });
+          break;
+        }
+        
         const subscriptionData = {
           user_id: userId,
           stripe_customer_id: subscription.customer,
@@ -202,21 +242,17 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           status: subscription.status,
           state: 'ACTIVE_PAID',
           plan: 'pro',
-          current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
-          current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+          current_period_start: new Date(periodStart * 1000).toISOString(),
+          current_period_end: new Date(periodEnd * 1000).toISOString(),
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         };
         
-        console.log('💾 Inserting/updating subscription:', subscriptionData);
+        console.log('💾 Inserting subscription with data:', JSON.stringify(subscriptionData, null, 2));
         
-        // Try insert first, if conflict then update
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
-          .upsert(subscriptionData, { 
-            onConflict: 'stripe_subscription_id',
-            ignoreDuplicates: false 
-          })
+          .insert(subscriptionData)
           .select()
           .single();
         
@@ -224,7 +260,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           console.error('❌ Failed to write subscription:', error);
           console.error('❌ Error details:', JSON.stringify(error, null, 2));
         } else {
-          console.log('✅ Subscription created/updated in Supabase:', data);
+          console.log('✅ Subscription created in Supabase:', data);
         }
       } catch (err) {
         console.error('❌ Supabase write error:', err.message);
