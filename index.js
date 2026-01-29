@@ -532,28 +532,50 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
 
     console.log(`📤 Uploading recording for user ${userId}, duration: ${duration}s, size: ${req.file.size} bytes`);
 
-    // PHASE 3: Server-side storage limit enforcement (CRITICAL - fail-closed)
-    // 1. Get user's subscription to determine storage limit
-    let storageLimit = 104857600; // 100 MB default for free tier
+    // PHASE 3: Server-side storage limit enforcement (CRITICAL - fail-safe)
+    // Storage limits MUST match pricing table:
+    // Free: 250 MB | Pro: 5 GB | Plus: 20 GB | Business: 100 GB
+    
+    let storageLimit = 262144000; // 250 MB default for free tier (matches pricing)
+    let planTier = 'free';
     
     try {
       const { data: subData, error: subError } = await supabaseAdmin
         .from('subscriptions')
-        .select('status')
+        .select('status, price_id')
         .eq('user_id', userId)
         .maybeSingle();
 
       if (subError) {
         console.error('⚠️ Failed to check subscription, using free tier limit:', subError);
       } else if (subData && (subData.status === 'active' || subData.status === 'trialing')) {
-        storageLimit = 10737418240; // 10 GB for Pro users
-        console.log('✅ Pro user - 10GB limit');
+        // Map price_id to storage limit (TODO: make this configurable)
+        const priceId = subData.price_id;
+        
+        if (priceId === process.env.STRIPE_PRICE_PRO) {
+          storageLimit = 5368709120; // 5 GB for Pro
+          planTier = 'pro';
+          console.log('✅ Pro user - 5GB limit');
+        } else if (priceId === process.env.STRIPE_PRICE_PLUS) {
+          storageLimit = 21474836480; // 20 GB for Plus
+          planTier = 'plus';
+          console.log('✅ Plus user - 20GB limit');
+        } else if (priceId === process.env.STRIPE_PRICE_BUSINESS) {
+          storageLimit = 107374182400; // 100 GB for Business
+          planTier = 'business';
+          console.log('✅ Business user - 100GB limit');
+        } else {
+          // Unknown price_id, default to Pro for active subscriptions
+          storageLimit = 5368709120; // 5 GB
+          planTier = 'pro';
+          console.log('⚠️ Unknown price_id, defaulting to Pro (5GB)');
+        }
       } else {
-        console.log('ℹ️ Free tier - 100MB limit');
+        console.log('ℹ️ Free tier - 250MB limit');
       }
     } catch (subCheckError) {
       console.error('⚠️ Subscription check failed, defaulting to free tier:', subCheckError);
-      // FAIL-CLOSED: If we can't check subscription, use free tier limit
+      // FAIL-SAFE: If we can't check subscription, use free tier limit (conservative)
     }
 
     // 2. Check current storage usage
