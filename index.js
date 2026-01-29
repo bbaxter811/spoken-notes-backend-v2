@@ -84,42 +84,72 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       
       // Fetch full subscription details from Stripe to get price_id and periods
       try {
+        if (!session.subscription) {
+          console.error('❌ No subscription ID in session');
+          break;
+        }
+        
+        console.log('🔍 Fetching subscription:', session.subscription);
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
+        
+        if (!subscription) {
+          console.error('❌ Failed to retrieve subscription from Stripe');
+          break;
+        }
+        
         const priceId = subscription.items.data[0]?.price.id || null;
         
         console.log('📦 Full subscription details:', {
           subscription_id: subscription.id,
           price_id: priceId,
           status: subscription.status,
-          current_period_end: new Date(subscription.current_period_end * 1000)
+          current_period_start: subscription.current_period_start,
+          current_period_end: subscription.current_period_end,
+          current_period_start_iso: subscription.current_period_start ? new Date(subscription.current_period_start * 1000).toISOString() : null,
+          current_period_end_iso: subscription.current_period_end ? new Date(subscription.current_period_end * 1000).toISOString() : null
         });
         
+        // Validate required fields
+        if (!subscription.current_period_start || !subscription.current_period_end) {
+          console.error('❌ Missing period timestamps:', {
+            start: subscription.current_period_start,
+            end: subscription.current_period_end
+          });
+          break;
+        }
+        
         // Insert subscription (no upsert - use insert only)
+        const subscriptionData = {
+          user_id: userId,
+          stripe_customer_id: session.customer,
+          stripe_subscription_id: subscription.id,
+          price_id: priceId,
+          status: subscription.status,
+          state: 'ACTIVE_PAID',
+          plan: 'pro', // TODO: Map from price_id to plan name
+          current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+          current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+        
+        console.log('💾 Inserting subscription to Supabase:', subscriptionData);
+        
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
-          .insert({
-            user_id: userId,
-            stripe_customer_id: session.customer,
-            stripe_subscription_id: subscription.id,
-            price_id: priceId,
-            status: subscription.status,
-            state: 'ACTIVE_PAID',
-            plan: 'pro', // TODO: Map from price_id to plan name
-            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
-            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
-          })
+          .insert(subscriptionData)
           .select()
           .single();
         
         if (error) {
           console.error('❌ Failed to write subscription to Supabase:', error);
+          console.error('❌ Error details:', JSON.stringify(error, null, 2));
         } else {
           console.log('✅ Subscription written to Supabase:', data);
         }
       } catch (err) {
-        console.error('❌ Subscription write error:', err);
+        console.error('❌ Subscription write error:', err.message);
+        console.error('❌ Stack:', err.stack);
       }
       break;
     }
