@@ -160,23 +160,32 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
     case 'customer.subscription.created': {
       const subscription = event.data.object;
+      
+      // CRITICAL: Log the ENTIRE event to see raw structure
+      console.log('🔍 RAW EVENT DATA (first 3000 chars):', JSON.stringify(event, null, 2).substring(0, 3000));
+      console.log('🔍 RAW SUBSCRIPTION OBJECT (first 3000 chars):', JSON.stringify(subscription, null, 2).substring(0, 3000));
+      
       console.log('📝 customer.subscription.created:', subscription.id);
       console.log('   Customer ID:', subscription.customer);
       console.log('   Status:', subscription.status);
-      console.log('   Period start (raw):', subscription.current_period_start);
-      console.log('   Period end (raw):', subscription.current_period_end);
       
-      // CRITICAL: Access fields from raw event data object
-      const periodStart = subscription.current_period_start;
-      const periodEnd = subscription.current_period_end;
+      // Try EVERY possible way to access the timestamps
+      const periodStart = subscription.current_period_start 
+        || subscription.currentPeriodStart
+        || event.data.object.current_period_start;
+      const periodEnd = subscription.current_period_end 
+        || subscription.currentPeriodEnd
+        || event.data.object.current_period_end;
       
-      console.log('🔍 Timestamp check:', { 
+      console.log('🔍 Timestamp extraction attempts:', { 
+        'subscription.current_period_start': subscription.current_period_start,
+        'subscription.current_period_end': subscription.current_period_end,
+        'event.data.object.current_period_start': event.data.object.current_period_start,
+        'event.data.object.current_period_end': event.data.object.current_period_end,
         periodStart, 
         periodEnd,
-        hasStart: periodStart !== undefined,
-        hasEnd: periodEnd !== undefined,
-        typeof_start: typeof periodStart,
-        typeof_end: typeof periodEnd
+        'typeof periodStart': typeof periodStart,
+        'typeof periodEnd': typeof periodEnd
       });
       
       // Try to find user_id by looking up stripe_customer_id OR from checkout session
