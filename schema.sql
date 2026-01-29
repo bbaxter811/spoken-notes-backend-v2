@@ -193,3 +193,18 @@ CREATE POLICY "Users can view their own subscription"
   USING (auth.uid() = user_id);
 
 -- Note: Only backend (service role) can INSERT/UPDATE subscriptions (from webhooks)
+
+-- ============================================================================
+-- PROCESSED STRIPE EVENTS (for webhook idempotency)
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS processed_stripe_events (
+  event_id TEXT PRIMARY KEY,
+  event_type TEXT NOT NULL,
+  processed_at TIMESTAMPTZ DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_processed_events_type ON processed_stripe_events(event_type);
+CREATE INDEX IF NOT EXISTS idx_processed_events_timestamp ON processed_stripe_events(processed_at);
+
+-- Cleanup old events (optional - keep last 30 days)
+-- DELETE FROM processed_stripe_events WHERE processed_at < NOW() - INTERVAL '30 days';

@@ -60,10 +60,27 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
   try {
     event = stripe.webhooks.constructEvent(req.body, sig, webhookSecret);
-    console.log(`✅ Stripe webhook received: ${event.type}`);
+    console.log(`✅ Stripe webhook received: ${event.type} (ID: ${event.id})`);
   } catch (err) {
     console.error(`❌ Webhook signature verification failed: ${err.message}`);
     return res.status(400).send(`Webhook Error: ${err.message}`);
+  }
+
+  // IDEMPOTENCY CHECK: Prevent duplicate event processing
+  try {
+    const { data: existingEvent } = await supabaseAdmin
+      .from('processed_stripe_events')
+      .select('event_id')
+      .eq('event_id', event.id)
+      .single();
+
+    if (existingEvent) {
+      console.log(`⚠️ Event ${event.id} already processed - skipping`);
+      return res.json({ received: true, status: 'already_processed' });
+    }
+  } catch (checkErr) {
+    // Error likely means event doesn't exist (expected for first processing)
+    console.log(`📝 First time processing event ${event.id}`);
   }
 
   // Handle different event types
@@ -377,6 +394,19 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       console.log(`⚠️ Unhandled event type: ${event.type}`);
   }
 
+  // Mark event as processed (idempotency tracking)
+  try {
+    await supabaseAdmin
+      .from('processed_stripe_events')
+      .insert({
+        event_id: event.id,
+        event_type: event.type
+      });
+    console.log(`✅ Event ${event.id} marked as processed`);
+  } catch (insertErr) {
+    console.error(`⚠️ Failed to mark event as processed (non-fatal):`, insertErr.message);
+  }
+
   res.json({ received: true });
 });
 
@@ -451,6 +481,159 @@ app.get('/health', (req, res) => {
     timestamp: new Date().toISOString(),
     message: 'Backend V2 - Minimal'
   });
+});
+
+/**
+ * TEMPORARY TEST ENDPOINT (Phase 3 validation only)
+ * POST /api/test/smoke
+ * Validates subscription + storage enforcement without bearer token
+ * Guarded by TEST_SECRET environment variable
+ * 
+ * REMOVE AFTER PHASE 3 VALIDATION COMPLETE
+ */
+app.post('/api/test/smoke', async (req, res) => {
+  const { secret, userId, testType } = req.body;
+
+  // Verify test secret
+  const TEST_SECRET = process.env.TEST_SECRET;
+  if (!TEST_SECRET) {
+    return res.status(503).json({ error: 'Test endpoint disabled (no TEST_SECRET)' });
+  }
+
+  if (secret !== TEST_SECRET) {
+    return res.status(403).json({ error: 'Invalid test secret' });
+  }
+
+  if (!userId) {
+    return res.status(400).json({ error: 'userId required' });
+  }
+
+  console.log(`🧪 Test endpoint: ${testType} for user ${userId}`);
+
+  try {
+    if (testType === 'subscription') {
+      // Test 1: Check subscription endpoint logic
+      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+      const { data: subData, error: subError } = await supabase
+        .from('subscriptions')
+        .select('status, price_id, stripe_customer_id, stripe_subscription_id, current_period_end')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (subError) {
+        return res.status(500).json({ error: 'Subscription lookup failed', details: subError.message });
+      }
+
+      // Determine storage cap
+      let storageLimit = 104857600; // 100 MB default (free)
+      let planTier = 'free';
+
+      if (subData && (subData.status === 'active' || subData.status === 'trialing')) {
+        const priceId = subData.price_id;
+        if (priceId === process.env.STRIPE_PRICE_PRO) {
+          storageLimit = 5368709120; // 5 GB
+          planTier = 'pro';
+        } else {
+          storageLimit = 5368709120; // Unknown price_id = pro (safe default for paying customers)
+          planTier = 'pro';
+        }
+      }
+
+      // Get storage usage
+      const { data: usageData } = await supabase
+        .from('user_storage_usage')
+        .select('total_bytes')
+        .eq('user_id', userId)
+        .single();
+
+      const storageUsed = usageData?.total_bytes || 0;
+
+      return res.json({
+        testType: 'subscription',
+        userId,
+        subscription: subData || { status: 'free', message: 'No subscription row' },
+        storageLimit,
+        storageUsed,
+        planTier,
+        percentUsed: Math.round((storageUsed / storageLimit) * 100)
+      });
+
+    } else if (testType === 'upload_check') {
+      // Test 2: Simulate upload storage check (without actual file)
+      const { fileSize } = req.body;
+
+      if (!fileSize) {
+        return res.status(400).json({ error: 'fileSize required for upload_check' });
+      }
+
+      const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
+
+      // Check subscription
+      let storageLimit = 104857600; // 100 MB default
+      let planTier = 'free';
+
+      const { data: subData } = await supabase
+        .from('subscriptions')
+        .select('status, price_id')
+        .eq('user_id', userId)
+        .maybeSingle();
+
+      if (subData && (subData.status === 'active' || subData.status === 'trialing')) {
+        const priceId = subData.price_id;
+        if (priceId === process.env.STRIPE_PRICE_PRO) {
+          storageLimit = 5368709120; // 5 GB
+          planTier = 'pro';
+        } else {
+          storageLimit = 5368709120;
+          planTier = 'pro';
+        }
+      }
+
+      // Get current usage
+      const { data: usageData } = await supabase
+        .from('user_storage_usage')
+        .select('total_bytes')
+        .eq('user_id', userId)
+        .single();
+
+      const currentUsage = usageData?.total_bytes || 0;
+      const projectedTotal = currentUsage + fileSize;
+
+      if (projectedTotal > storageLimit) {
+        return res.status(402).json({
+          testType: 'upload_check',
+          result: 'BLOCKED',
+          code: 'STORAGE_LIMIT',
+          blocked_reason: 'CAP_WOULD_EXCEED',
+          message: 'Storage limit reached. Upgrade your plan to continue.',
+          currentUsage,
+          storageLimit,
+          fileSize,
+          projectedTotal,
+          planTier
+        });
+      }
+
+      return res.json({
+        testType: 'upload_check',
+        result: 'ALLOWED',
+        currentUsage,
+        storageLimit,
+        fileSize,
+        projectedTotal,
+        percentUsed: Math.round((projectedTotal / storageLimit) * 100),
+        planTier
+      });
+
+    } else {
+      return res.status(400).json({ error: 'Unknown testType. Use "subscription" or "upload_check"' });
+    }
+
+  } catch (error) {
+    console.error('🧪 Test endpoint error:', error);
+    return res.status(500).json({ error: 'Test failed', details: error.message });
+  }
 });
 
 // Test Supabase connection
