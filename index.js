@@ -74,34 +74,34 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       console.log('   Customer ID:', session.customer);
       console.log('   Subscription ID:', session.subscription);
       console.log('   Client Reference ID:', session.client_reference_id); // This should be user_id
-      
+
       const userId = session.client_reference_id; // App must pass user_id here
-      
+
       if (!userId) {
         console.error('❌ No client_reference_id - cannot map to user');
         break;
       }
-      
+
       // Fetch full subscription details from Stripe to get price_id and periods
       try {
         if (!session.subscription) {
           console.error('❌ No subscription ID in session');
           break;
         }
-        
+
         console.log('🔍 Fetching subscription:', session.subscription);
         const subscription = await stripe.subscriptions.retrieve(session.subscription);
-        
+
         if (!subscription) {
           console.error('❌ Failed to retrieve subscription from Stripe');
           break;
         }
-        
+
         // Log the ENTIRE subscription object to debug
         console.log('📦 RAW subscription object:', JSON.stringify(subscription, null, 2).substring(0, 2000));
-        
+
         const priceId = subscription.items.data[0]?.price.id || null;
-        
+
         console.log('📦 Extracted fields:', {
           subscription_id: subscription.id,
           price_id: priceId,
@@ -109,7 +109,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           current_period_start: subscription.current_period_start,
           current_period_end: subscription.current_period_end
         });
-        
+
         // If timestamps are missing, skip and let customer.subscription.created handle it
         if (!subscription.current_period_start || !subscription.current_period_end) {
           console.warn('⚠️ Missing period timestamps - will be handled by customer.subscription.created event');
@@ -121,7 +121,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           });
           break;
         }
-        
+
         // Insert subscription (no upsert - use insert only)
         const subscriptionData = {
           user_id: userId,
@@ -136,15 +136,15 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         };
-        
+
         console.log('💾 Inserting subscription to Supabase:', subscriptionData);
-        
+
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
           .insert(subscriptionData)
           .select()
           .single();
-        
+
         if (error) {
           console.error('❌ Failed to write subscription to Supabase:', error);
           console.error('❌ Error details:', JSON.stringify(error, null, 2));
@@ -160,28 +160,28 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
     case 'customer.subscription.created': {
       const subscription = event.data.object;
-      
+
       console.log('📝 customer.subscription.created:', subscription.id);
       console.log('   Customer ID:', subscription.customer);
       console.log('   Status:', subscription.status);
-      
+
       // CRITICAL: Timestamps are on the subscription ITEM, not the subscription itself
       const firstItem = subscription.items?.data?.[0];
       const periodStart = firstItem?.current_period_start;
       const periodEnd = firstItem?.current_period_end;
-      
-      console.log('✅ Timestamps from subscription item:', { 
-        periodStart, 
+
+      console.log('✅ Timestamps from subscription item:', {
+        periodStart,
         periodEnd,
         itemId: firstItem?.id
       });
-      
+
       // Try to find user_id by looking up stripe_customer_id OR from checkout session
       let userId = subscription.metadata?.user_id;
-      
+
       if (!userId) {
         console.log('⚠️ No metadata.user_id - attempting to find via stripe_customer_id');
-        
+
         // First try: Look for existing subscription with this customer
         try {
           const { data: existingRows, error: lookupError } = await supabaseAdmin
@@ -189,7 +189,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
             .select('user_id')
             .eq('stripe_customer_id', subscription.customer)
             .limit(1);
-          
+
           if (existingRows && existingRows.length > 0) {
             userId = existingRows[0].user_id;
             console.log('✅ Found user_id via customer lookup:', userId);
@@ -197,7 +197,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         } catch (lookupErr) {
           console.error('❌ Customer lookup error:', lookupErr.message);
         }
-        
+
         // Second try: Query Stripe for the most recent checkout session with this customer
         if (!userId) {
           console.log('⚠️ Attempting to find userId via Stripe checkout sessions');
@@ -206,7 +206,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
               customer: subscription.customer,
               limit: 1
             });
-            
+
             if (sessions.data.length > 0 && sessions.data[0].client_reference_id) {
               userId = sessions.data[0].client_reference_id;
               console.log('✅ Found user_id via checkout session:', userId);
@@ -215,22 +215,22 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
             console.error('❌ Stripe session lookup error:', stripeErr.message);
           }
         }
-        
+
         if (!userId) {
           console.warn('⚠️ Could not find user_id - skipping this event');
           break;
         }
       }
-      
+
       const priceId = subscription.items?.data?.[0]?.price?.id || null;
-      
+
       try {
         // Validate timestamps exist
         if (!periodStart || !periodEnd) {
           console.error('❌ Missing timestamps even after extraction:', { periodStart, periodEnd });
           break;
         }
-        
+
         // Only include columns that exist in the Supabase table
         const subscriptionData = {
           user_id: userId,
@@ -245,9 +245,9 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
         };
-        
+
         console.log('💾 Upserting subscription with data:', JSON.stringify(subscriptionData, null, 2));
-        
+
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
           .upsert(subscriptionData, {
@@ -256,7 +256,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           })
           .select()
           .single();
-        
+
         if (error) {
           console.error('❌ Failed to upsert subscription:', error);
           console.error('❌ Error details:', JSON.stringify(error, null, 2));
@@ -274,30 +274,30 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       const subscription = event.data.object;
       console.log('🔄 Subscription updated:', subscription.id);
       console.log('   Status:', subscription.status);
-      
+
       try {
         // Get period_end from subscription items (same location as in created event)
         const firstItem = subscription.items?.data?.[0];
         const periodEnd = firstItem?.current_period_end;
-        
+
         const updateData = {
           status: subscription.status,
           updated_at: new Date().toISOString()
         };
-        
+
         // Only add current_period_end if we have a valid timestamp
         if (periodEnd) {
           updateData.current_period_end = new Date(periodEnd * 1000).toISOString();
         }
-        
+
         console.log('💾 Updating subscription with data:', updateData);
-        
+
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
           .update(updateData)
           .eq('stripe_subscription_id', subscription.id)
           .select();
-        
+
         if (error) {
           console.error('❌ Failed to update subscription:', error);
           console.error('❌ Error details:', JSON.stringify(error, null, 2));
@@ -314,7 +314,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
     case 'customer.subscription.deleted': {
       const subscription = event.data.object;
       console.log('❌ Subscription deleted:', subscription.id);
-      
+
       try {
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
@@ -323,7 +323,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
             updated_at: new Date().toISOString()
           })
           .eq('stripe_subscription_id', subscription.id);
-        
+
         if (error) {
           console.error('❌ Failed to mark subscription as canceled:', error);
         } else {
@@ -349,7 +349,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       console.log('💸 Payment failed:', invoice.id);
       console.log('   Customer:', invoice.customer);
       console.log('   Subscription:', invoice.subscription);
-      
+
       // Mark subscription as past_due
       if (invoice.subscription) {
         try {
@@ -360,7 +360,7 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
               updated_at: new Date().toISOString()
             })
             .eq('stripe_subscription_id', invoice.subscription);
-          
+
           if (error) {
             console.error('❌ Failed to update subscription status:', error);
           } else {
@@ -532,30 +532,63 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
 
     console.log(`📤 Uploading recording for user ${userId}, duration: ${duration}s, size: ${req.file.size} bytes`);
 
-    // PHASE 3: Storage limit enforcement (server-side check)
-    const capBytes = parseInt(process.env.STORAGE_CAP_BYTES) || 262144000; // 250 MB default
+    // PHASE 3: Server-side storage limit enforcement (CRITICAL - fail-closed)
+    // 1. Get user's subscription to determine storage limit
+    let storageLimit = 104857600; // 100 MB default for free tier
+    
+    try {
+      const { data: subData, error: subError } = await supabaseAdmin
+        .from('subscriptions')
+        .select('status')
+        .eq('user_id', userId)
+        .maybeSingle();
 
+      if (subError) {
+        console.error('⚠️ Failed to check subscription, using free tier limit:', subError);
+      } else if (subData && (subData.status === 'active' || subData.status === 'trialing')) {
+        storageLimit = 10737418240; // 10 GB for Pro users
+        console.log('✅ Pro user - 10GB limit');
+      } else {
+        console.log('ℹ️ Free tier - 100MB limit');
+      }
+    } catch (subCheckError) {
+      console.error('⚠️ Subscription check failed, defaulting to free tier:', subCheckError);
+      // FAIL-CLOSED: If we can't check subscription, use free tier limit
+    }
+
+    // 2. Check current storage usage
     const { data: usageData, error: usageError } = await supabaseAdmin
       .from('user_storage_usage')
       .select('total_bytes')
       .eq('user_id', userId)
       .single();
 
-    const currentUsage = usageData?.total_bytes || 0;
-    const newTotal = currentUsage + req.file.size;
-
-    if (newTotal > capBytes) {
-      console.log(`🚫 Storage limit exceeded: ${newTotal} > ${capBytes} bytes`);
-      return res.status(402).json({
-        code: 'STORAGE_LIMIT',
-        error: 'Storage limit exceeded',
-        total_bytes: currentUsage,
-        cap_bytes: capBytes,
-        upload_size: req.file.size
+    if (usageError && usageError.code !== 'PGRST116') {
+      console.error('❌ Failed to check storage usage:', usageError);
+      return res.status(500).json({ 
+        code: 'STORAGE_CHECK_FAILED',
+        error: 'Unable to verify storage limit. Please try again.' 
       });
     }
 
-    console.log(`✅ Storage check passed: ${newTotal} / ${capBytes} bytes`);
+    const currentUsage = usageData?.total_bytes || 0;
+    const newTotal = currentUsage + req.file.size;
+
+    // 3. Enforce storage limit (FAIL-CLOSED)
+    if (newTotal > storageLimit) {
+      console.log(`🚫 Storage limit exceeded: ${newTotal} > ${storageLimit} bytes`);
+      return res.status(402).json({
+        code: 'STORAGE_LIMIT',
+        blocked_reason: 'CAP_WOULD_EXCEED',
+        message: 'Storage limit reached. Upgrade your plan to continue.',
+        total_bytes: currentUsage,
+        cap_bytes: storageLimit,
+        upload_size_bytes: req.file.size,
+        projected_total_bytes: newTotal
+      });
+    }
+
+    console.log(`✅ Storage check passed: ${newTotal} / ${storageLimit} bytes (${Math.round(newTotal/storageLimit*100)}% used)`);
 
     // 1. Upload audio to Supabase Storage
     const fileName = `${recordingId}-${Date.now()}.${req.file.originalname.split('.').pop()}`;
