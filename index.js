@@ -483,15 +483,59 @@ app.get('/health', (req, res) => {
   });
 });
 
+// PROTECTION 1: Rate limiting - in-memory tracker (resets on server restart)
+const testEndpointRateLimits = new Map(); // { ip: { count, resetAt } }
+const TEST_RATE_LIMIT = 20; // Max requests per IP per hour
+const TEST_RATE_WINDOW = 60 * 60 * 1000; // 1 hour in ms
+
+// PROTECTION 2: Hard expiry - endpoint refuses after this date
+const TEST_ENDPOINT_EXPIRY = new Date('2026-02-02T00:00:00Z'); // 72 hours from now (Feb 2, 2026)
+
 /**
  * TEMPORARY TEST ENDPOINT (Phase 3 validation only)
  * POST /api/test/smoke
  * Validates subscription + storage enforcement without bearer token
  * Guarded by TEST_SECRET environment variable
  * 
+ * PROTECTIONS:
+ * - Rate limit: 20 requests per IP per hour
+ * - Hard expiry: Refuses requests after Feb 2, 2026
+ * 
  * REMOVE AFTER PHASE 3 VALIDATION COMPLETE
  */
 app.post('/api/test/smoke', async (req, res) => {
+  // PROTECTION 2: Check hard expiry first
+  if (new Date() > TEST_ENDPOINT_EXPIRY) {
+    console.error(`🚫 Test endpoint expired (after ${TEST_ENDPOINT_EXPIRY.toISOString()})`);
+    return res.status(410).json({ 
+      error: 'Test endpoint expired', 
+      message: 'This temporary endpoint is no longer available. Remove TEST_SECRET and test endpoint code.' 
+    });
+  }
+
+  // PROTECTION 1: Rate limiting
+  const clientIp = req.ip || req.headers['x-forwarded-for'] || 'unknown';
+  const now = Date.now();
+  
+  let rateLimit = testEndpointRateLimits.get(clientIp);
+  if (!rateLimit || now > rateLimit.resetAt) {
+    // New window
+    rateLimit = { count: 0, resetAt: now + TEST_RATE_WINDOW };
+    testEndpointRateLimits.set(clientIp, rateLimit);
+  }
+
+  rateLimit.count++;
+  
+  if (rateLimit.count > TEST_RATE_LIMIT) {
+    const resetIn = Math.ceil((rateLimit.resetAt - now) / 1000 / 60); // minutes
+    console.warn(`⚠️ Rate limit exceeded for IP ${clientIp} (${rateLimit.count} requests)`);
+    return res.status(429).json({ 
+      error: 'Rate limit exceeded', 
+      message: `Too many requests. Try again in ${resetIn} minutes.`,
+      retryAfter: resetIn * 60 // seconds
+    });
+  }
+
   const { secret, userId, testType } = req.body;
 
   // Verify test secret
@@ -501,6 +545,7 @@ app.post('/api/test/smoke', async (req, res) => {
   }
 
   if (secret !== TEST_SECRET) {
+    console.warn(`⚠️ Invalid test secret attempt from IP ${clientIp}`);
     return res.status(403).json({ error: 'Invalid test secret' });
   }
 
