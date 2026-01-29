@@ -97,23 +97,27 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           break;
         }
         
+        // Log the ENTIRE subscription object to debug
+        console.log('📦 RAW subscription object:', JSON.stringify(subscription, null, 2).substring(0, 2000));
+        
         const priceId = subscription.items.data[0]?.price.id || null;
         
-        console.log('📦 Full subscription details:', {
+        console.log('📦 Extracted fields:', {
           subscription_id: subscription.id,
           price_id: priceId,
           status: subscription.status,
           current_period_start: subscription.current_period_start,
-          current_period_end: subscription.current_period_end,
-          current_period_start_iso: subscription.current_period_start ? new Date(subscription.current_period_start * 1000).toISOString() : null,
-          current_period_end_iso: subscription.current_period_end ? new Date(subscription.current_period_end * 1000).toISOString() : null
+          current_period_end: subscription.current_period_end
         });
         
-        // Validate required fields
+        // If timestamps are missing, skip and let customer.subscription.created handle it
         if (!subscription.current_period_start || !subscription.current_period_end) {
-          console.error('❌ Missing period timestamps:', {
-            start: subscription.current_period_start,
-            end: subscription.current_period_end
+          console.warn('⚠️ Missing period timestamps - will be handled by customer.subscription.created event');
+          console.log('⚠️ Session details for reference:', {
+            session_id: session.id,
+            customer: session.customer,
+            subscription: session.subscription,
+            status: session.status
           });
           break;
         }
@@ -156,46 +160,75 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
 
     case 'customer.subscription.created': {
       const subscription = event.data.object;
-      console.log('📝 Subscription created:', subscription.id);
+      console.log('📝 customer.subscription.created:', subscription.id);
       console.log('   Customer ID:', subscription.customer);
       console.log('   Status:', subscription.status);
-      console.log('   Metadata:', JSON.stringify(subscription.metadata));
+      console.log('   Period start:', subscription.current_period_start);
+      console.log('   Period end:', subscription.current_period_end);
       
-      const userId = subscription.metadata?.user_id; // Check metadata for user_id
+      // Try to find user_id by stripe_customer_id (may have been created in checkout.session.completed)
+      let userId = subscription.metadata?.user_id;
       
       if (!userId) {
-        console.warn('⚠️ No metadata.user_id - skipping (checkout.session.completed should have handled this)');
-        break;
+        console.log('⚠️ No metadata.user_id - attempting to find via stripe_customer_id');
+        try {
+          const { data: existingUser, error: lookupError } = await supabaseAdmin
+            .from('subscriptions')
+            .select('user_id')
+            .eq('stripe_customer_id', subscription.customer)
+            .single();
+          
+          if (existingUser) {
+            userId = existingUser.user_id;
+            console.log('✅ Found user_id via customer lookup:', userId);
+          } else {
+            console.warn('⚠️ Could not find user_id - skipping this event');
+            break;
+          }
+        } catch (lookupErr) {
+          console.error('❌ User lookup failed:', lookupErr.message);
+          break;
+        }
       }
       
       const priceId = subscription.items.data[0]?.price.id || null;
       
       try {
+        const subscriptionData = {
+          user_id: userId,
+          stripe_customer_id: subscription.customer,
+          stripe_subscription_id: subscription.id,
+          price_id: priceId,
+          status: subscription.status,
+          state: 'ACTIVE_PAID',
+          plan: 'pro',
+          current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+          current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+          created_at: new Date().toISOString(),
+          updated_at: new Date().toISOString()
+        };
+        
+        console.log('💾 Inserting/updating subscription:', subscriptionData);
+        
+        // Try insert first, if conflict then update
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
-          .insert({
-            user_id: userId,
-            stripe_customer_id: subscription.customer,
-            stripe_subscription_id: subscription.id,
-            price_id: priceId,
-            status: subscription.status,
-            state: 'ACTIVE_PAID',
-            plan: 'pro',
-            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
-            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
-            created_at: new Date().toISOString(),
-            updated_at: new Date().toISOString()
+          .upsert(subscriptionData, { 
+            onConflict: 'stripe_subscription_id',
+            ignoreDuplicates: false 
           })
           .select()
           .single();
         
         if (error) {
           console.error('❌ Failed to write subscription:', error);
+          console.error('❌ Error details:', JSON.stringify(error, null, 2));
         } else {
-          console.log('✅ Subscription created in Supabase:', data);
+          console.log('✅ Subscription created/updated in Supabase:', data);
         }
       } catch (err) {
-        console.error('❌ Supabase write error:', err);
+        console.error('❌ Supabase write error:', err.message);
+        console.error('❌ Stack:', err.stack);
       }
       break;
     }
