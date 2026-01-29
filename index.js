@@ -231,15 +231,16 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           break;
         }
         
+        // Only include columns that exist in the Supabase table
         const subscriptionData = {
           user_id: userId,
           stripe_customer_id: subscription.customer,
           stripe_subscription_id: subscription.id,
           price_id: priceId,
           status: subscription.status,
-          state: 'ACTIVE_PAID',
-          plan: 'pro',
-          current_period_start: new Date(periodStart * 1000).toISOString(),
+          // state: 'ACTIVE_PAID',  // Column doesn't exist in current schema
+          // plan: 'pro',  // Column doesn't exist in current schema
+          // current_period_start: new Date(periodStart * 1000).toISOString(),  // Column doesn't exist
           current_period_end: new Date(periodEnd * 1000).toISOString(),
           created_at: new Date().toISOString(),
           updated_at: new Date().toISOString()
