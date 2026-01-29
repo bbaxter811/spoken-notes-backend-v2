@@ -246,19 +246,22 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
           updated_at: new Date().toISOString()
         };
         
-        console.log('💾 Inserting subscription with data:', JSON.stringify(subscriptionData, null, 2));
+        console.log('💾 Upserting subscription with data:', JSON.stringify(subscriptionData, null, 2));
         
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
-          .insert(subscriptionData)
+          .upsert(subscriptionData, {
+            onConflict: 'stripe_subscription_id',
+            ignoreDuplicates: false
+          })
           .select()
           .single();
         
         if (error) {
-          console.error('❌ Failed to write subscription:', error);
+          console.error('❌ Failed to upsert subscription:', error);
           console.error('❌ Error details:', JSON.stringify(error, null, 2));
         } else {
-          console.log('✅ Subscription created in Supabase:', data);
+          console.log('✅ Subscription upserted in Supabase (idempotent):', data);
         }
       } catch (err) {
         console.error('❌ Supabase write error:', err.message);
@@ -273,23 +276,37 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       console.log('   Status:', subscription.status);
       
       try {
+        // Get period_end from subscription items (same location as in created event)
+        const firstItem = subscription.items?.data?.[0];
+        const periodEnd = firstItem?.current_period_end;
+        
+        const updateData = {
+          status: subscription.status,
+          updated_at: new Date().toISOString()
+        };
+        
+        // Only add current_period_end if we have a valid timestamp
+        if (periodEnd) {
+          updateData.current_period_end = new Date(periodEnd * 1000).toISOString();
+        }
+        
+        console.log('💾 Updating subscription with data:', updateData);
+        
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
-          .update({
-            status: subscription.status,
-            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
-            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
-            updated_at: new Date().toISOString()
-          })
-          .eq('stripe_subscription_id', subscription.id);
+          .update(updateData)
+          .eq('stripe_subscription_id', subscription.id)
+          .select();
         
         if (error) {
           console.error('❌ Failed to update subscription:', error);
+          console.error('❌ Error details:', JSON.stringify(error, null, 2));
         } else {
-          console.log('✅ Subscription updated in Supabase');
+          console.log('✅ Subscription updated in Supabase:', data);
         }
       } catch (err) {
-        console.error('❌ Supabase write error:', err);
+        console.error('❌ Supabase write error:', err.message);
+        console.error('❌ Stack:', err.stack);
       }
       break;
     }
