@@ -161,31 +161,19 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
     case 'customer.subscription.created': {
       const subscription = event.data.object;
       
-      // CRITICAL: Log the ENTIRE event to see raw structure
-      console.log('🔍 RAW EVENT DATA (first 3000 chars):', JSON.stringify(event, null, 2).substring(0, 3000));
-      console.log('🔍 RAW SUBSCRIPTION OBJECT (first 3000 chars):', JSON.stringify(subscription, null, 2).substring(0, 3000));
-      
       console.log('📝 customer.subscription.created:', subscription.id);
       console.log('   Customer ID:', subscription.customer);
       console.log('   Status:', subscription.status);
       
-      // Try EVERY possible way to access the timestamps
-      const periodStart = subscription.current_period_start 
-        || subscription.currentPeriodStart
-        || event.data.object.current_period_start;
-      const periodEnd = subscription.current_period_end 
-        || subscription.currentPeriodEnd
-        || event.data.object.current_period_end;
+      // CRITICAL: Timestamps are on the subscription ITEM, not the subscription itself
+      const firstItem = subscription.items?.data?.[0];
+      const periodStart = firstItem?.current_period_start;
+      const periodEnd = firstItem?.current_period_end;
       
-      console.log('🔍 Timestamp extraction attempts:', { 
-        'subscription.current_period_start': subscription.current_period_start,
-        'subscription.current_period_end': subscription.current_period_end,
-        'event.data.object.current_period_start': event.data.object.current_period_start,
-        'event.data.object.current_period_end': event.data.object.current_period_end,
+      console.log('✅ Timestamps from subscription item:', { 
         periodStart, 
         periodEnd,
-        'typeof periodStart': typeof periodStart,
-        'typeof periodEnd': typeof periodEnd
+        itemId: firstItem?.id
       });
       
       // Try to find user_id by looking up stripe_customer_id OR from checkout session
