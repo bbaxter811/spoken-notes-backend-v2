@@ -82,27 +82,44 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
         break;
       }
       
-      // Update user subscription status
+      // Fetch full subscription details from Stripe to get price_id and periods
       try {
+        const subscription = await stripe.subscriptions.retrieve(session.subscription);
+        const priceId = subscription.items.data[0]?.price.id || null;
+        
+        console.log('📦 Full subscription details:', {
+          subscription_id: subscription.id,
+          price_id: priceId,
+          status: subscription.status,
+          current_period_end: new Date(subscription.current_period_end * 1000)
+        });
+        
+        // Insert subscription (no upsert - use insert only)
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
-          .upsert({
+          .insert({
             user_id: userId,
             stripe_customer_id: session.customer,
-            stripe_subscription_id: session.subscription,
-            status: 'active',
+            stripe_subscription_id: subscription.id,
+            price_id: priceId,
+            status: subscription.status,
+            state: 'ACTIVE_PAID',
+            plan: 'pro', // TODO: Map from price_id to plan name
+            current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
+            current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+            created_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
-          }, {
-            onConflict: 'user_id'
-          });
+          })
+          .select()
+          .single();
         
         if (error) {
           console.error('❌ Failed to write subscription to Supabase:', error);
         } else {
-          console.log('✅ Subscription written to Supabase for user:', userId);
+          console.log('✅ Subscription written to Supabase:', data);
         }
       } catch (err) {
-        console.error('❌ Supabase write error:', err);
+        console.error('❌ Subscription write error:', err);
       }
       break;
     }
@@ -117,29 +134,35 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
       const userId = subscription.metadata?.user_id; // Check metadata for user_id
       
       if (!userId) {
-        console.error('❌ No metadata.user_id - cannot map to user');
+        console.warn('⚠️ No metadata.user_id - skipping (checkout.session.completed should have handled this)');
         break;
       }
+      
+      const priceId = subscription.items.data[0]?.price.id || null;
       
       try {
         const { data, error } = await supabaseAdmin
           .from('subscriptions')
-          .upsert({
+          .insert({
             user_id: userId,
             stripe_customer_id: subscription.customer,
             stripe_subscription_id: subscription.id,
+            price_id: priceId,
             status: subscription.status,
+            state: 'ACTIVE_PAID',
+            plan: 'pro',
             current_period_start: new Date(subscription.current_period_start * 1000).toISOString(),
             current_period_end: new Date(subscription.current_period_end * 1000).toISOString(),
+            created_at: new Date().toISOString(),
             updated_at: new Date().toISOString()
-          }, {
-            onConflict: 'user_id'
-          });
+          })
+          .select()
+          .single();
         
         if (error) {
           console.error('❌ Failed to write subscription:', error);
         } else {
-          console.log('✅ Subscription created in Supabase for user:', userId);
+          console.log('✅ Subscription created in Supabase:', data);
         }
       } catch (err) {
         console.error('❌ Supabase write error:', err);
