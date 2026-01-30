@@ -1624,6 +1624,70 @@ app.get('/api/billing/usage', authenticateUser, async (req, res) => {
   }
 });
 
+/**
+ * GET /api/billing/subscription
+ * Returns subscription info + storage metrics (Phase 3: Single source of truth)
+ * Used by mobile app for pre-flight storage checks
+ */
+app.get('/api/billing/subscription', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    console.log(`📊 Subscription info request from user ${userId}`);
+
+    // Get storage cap based on plan
+    // For now: hardcoded to Free (100 MB)
+    // TODO: Query subscriptions table when multi-tier billing is implemented
+    const plan = 'free';
+    let storageCapBytes;
+
+    switch (plan) {
+      case 'pro':
+        storageCapBytes = 5368709120; // 5 GB
+        break;
+      case 'plus':
+        storageCapBytes = 5368709120; // 5 GB (same as Pro for now)
+        break;
+      case 'business':
+        storageCapBytes = 5368709120; // 5 GB (same as Pro for now)
+        break;
+      case 'free':
+      default:
+        storageCapBytes = 104857600; // 100 MB
+        break;
+    }
+
+    // Query storage usage from user_storage_usage view
+    const { data, error } = await supabaseAdmin
+      .from('user_storage_usage')
+      .select('total_bytes')
+      .eq('user_id', userId)
+      .single();
+
+    if (error && error.code !== 'PGRST116') { // PGRST116 = no rows
+      console.error('❌ Storage query error:', error);
+      return res.status(500).json({ error: 'Failed to fetch storage usage' });
+    }
+
+    const storageUsedBytes = data?.total_bytes || 0;
+
+    const subscription = {
+      status: 'active', // TODO: Read from subscriptions table
+      plan: plan,
+      current_period_end: null, // TODO: Read from subscriptions table
+      storage_used: storageUsedBytes,
+      storage_limit: storageCapBytes,
+    };
+
+    console.log(`✅ Subscription: ${plan} | Storage: ${storageUsedBytes} / ${storageCapBytes} bytes`);
+
+    res.json(subscription);
+
+  } catch (err) {
+    console.error('❌ Subscription retrieval error:', err);
+    res.status(500).json({ error: 'Failed to retrieve subscription' });
+  }
+});
+
 // Start server
 console.log('📍 About to call app.listen() on port', PORT);
 const server = app.listen(PORT, '0.0.0.0')
