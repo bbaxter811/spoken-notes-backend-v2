@@ -1084,7 +1084,18 @@ app.delete('/api/recordings/:id', authenticateUser, async (req, res) => {
       return res.status(404).json({ error: 'Recording not found' });
     }
 
-    // Delete from database
+    // Extract storage path from audio_url
+    // Example URL: https://...supabase.co/storage/v1/object/public/recordings/user123/file.wav
+    // We need: user123/file.wav
+    let storageFilePath = null;
+    if (recording.audio_url) {
+      const urlMatch = recording.audio_url.match(/\/recordings\/(.+)$/);
+      if (urlMatch) {
+        storageFilePath = urlMatch[1];
+      }
+    }
+
+    // Delete from database first
     const { error: deleteError } = await supabaseAdmin
       .from('recordings')
       .delete()
@@ -1096,9 +1107,25 @@ app.delete('/api/recordings/:id', authenticateUser, async (req, res) => {
       return res.status(500).json({ error: 'Failed to delete recording' });
     }
 
-    // TODO: Delete from storage (extract path from audio_url)
-    // const filePath = extractPathFromUrl(recording.audio_url);
-    // await supabaseAdmin.storage.from('recordings').remove([filePath]);
+    // Delete audio file from storage (if path was extracted)
+    if (storageFilePath) {
+      try {
+        const { error: storageError } = await supabaseAdmin.storage
+          .from('recordings')
+          .remove([storageFilePath]);
+        
+        if (storageError) {
+          console.error('⚠️ Storage delete error (non-blocking):', storageError);
+          // Don't fail the request - database record already deleted
+        } else {
+          console.log(`✅ Deleted audio file from storage: ${storageFilePath}`);
+        }
+      } catch (storageErr) {
+        console.error('⚠️ Storage delete exception (non-blocking):', storageErr);
+      }
+    } else {
+      console.log('⚠️ No storage path extracted from audio_url - skipping storage delete');
+    }
 
     res.json({
       success: true,
