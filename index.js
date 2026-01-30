@@ -1715,6 +1715,206 @@ app.get('/api/billing/subscription', authenticateUser, async (req, res) => {
   }
 });
 
+/**
+ * POST /api/billing/cleanup-orphaned-storage
+ * Find and delete audio files in storage that have no corresponding DB record
+ * This handles orphaned files from deletions before the storage deletion fix
+ */
+app.post('/api/billing/cleanup-orphaned-storage', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    console.log(`🧹 Storage cleanup request from user ${userId}`);
+
+    // Get all audio files for this user from storage
+    const { data: storageFiles, error: storageError } = await supabaseAdmin.storage
+      .from('recordings')
+      .list(userId, {
+        limit: 1000,
+        sortBy: { column: 'created_at', order: 'desc' }
+      });
+
+    if (storageError) {
+      console.error('❌ Storage list error:', storageError);
+      return res.status(500).json({ error: 'Failed to list storage files' });
+    }
+
+    if (!storageFiles || storageFiles.length === 0) {
+      console.log('✅ No files in storage for this user');
+      return res.json({ 
+        success: true, 
+        orphaned_count: 0, 
+        bytes_freed: 0,
+        message: 'No files found in storage' 
+      });
+    }
+
+    // Get all recording audio URLs from database for this user
+    const { data: recordings, error: dbError } = await supabaseAdmin
+      .from('recordings')
+      .select('audio_url')
+      .eq('user_id', userId);
+
+    if (dbError) {
+      console.error('❌ Database query error:', dbError);
+      return res.status(500).json({ error: 'Failed to query recordings' });
+    }
+
+    // Extract filenames from audio URLs
+    const dbFilenames = new Set();
+    (recordings || []).forEach(rec => {
+      if (rec.audio_url) {
+        const match = rec.audio_url.match(/\/([^\/]+)$/);
+        if (match) {
+          dbFilenames.add(match[1]);
+        }
+      }
+    });
+
+    console.log(`📊 Storage: ${storageFiles.length} files | DB: ${dbFilenames.size} references`);
+
+    // Find orphaned files (in storage but not in DB)
+    const orphanedFiles = [];
+    let totalBytesFreed = 0;
+
+    storageFiles.forEach(file => {
+      if (!dbFilenames.has(file.name)) {
+        orphanedFiles.push(`${userId}/${file.name}`);
+        totalBytesFreed += file.metadata?.size || 0;
+      }
+    });
+
+    if (orphanedFiles.length === 0) {
+      console.log('✅ No orphaned files found - storage is clean');
+      return res.json({ 
+        success: true, 
+        orphaned_count: 0, 
+        bytes_freed: 0,
+        message: 'Storage is already clean - no orphaned files' 
+      });
+    }
+
+    console.log(`🗑️ Found ${orphanedFiles.length} orphaned files (${Math.round(totalBytesFreed / 1024 / 1024)} MB)`);
+
+    // Delete orphaned files in batches of 50
+    const batchSize = 50;
+    let deletedCount = 0;
+
+    for (let i = 0; i < orphanedFiles.length; i += batchSize) {
+      const batch = orphanedFiles.slice(i, i + batchSize);
+      const { error: deleteError } = await supabaseAdmin.storage
+        .from('recordings')
+        .remove(batch);
+
+      if (deleteError) {
+        console.error(`⚠️ Batch delete error (continuing):`, deleteError);
+      } else {
+        deletedCount += batch.length;
+        console.log(`✅ Deleted batch ${Math.floor(i / batchSize) + 1}: ${batch.length} files`);
+      }
+    }
+
+    console.log(`🎉 Cleanup complete: ${deletedCount}/${orphanedFiles.length} files deleted, ${Math.round(totalBytesFreed / 1024 / 1024)} MB freed`);
+
+    res.json({
+      success: true,
+      orphaned_count: deletedCount,
+      bytes_freed: totalBytesFreed,
+      message: `Deleted ${deletedCount} orphaned files (${Math.round(totalBytesFreed / 1024 / 1024)} MB freed)`
+    });
+
+  } catch (err) {
+    console.error('❌ Storage cleanup error:', err);
+    res.status(500).json({ error: 'Failed to cleanup storage' });
+  }
+});
+
+// Automated daily cleanup: Find and remove orphaned storage files across all users
+async function cleanupOrphanedStorageGlobal() {
+  try {
+    console.log('🧹 [CRON] Starting automated global storage cleanup...');
+
+    // Get all users with recordings
+    const { data: users, error: userError } = await supabaseAdmin
+      .from('recordings')
+      .select('user_id')
+      .limit(1000);
+
+    if (userError || !users) {
+      console.error('❌ [CRON] Failed to get users:', userError);
+      return;
+    }
+
+    const uniqueUsers = [...new Set(users.map(u => u.user_id))];
+    console.log(`📊 [CRON] Checking storage for ${uniqueUsers.length} users...`);
+
+    let totalOrphaned = 0;
+    let totalBytesFreed = 0;
+
+    // Process each user (limit to 100 per run to avoid timeouts)
+    for (const userId of uniqueUsers.slice(0, 100)) {
+      try {
+        // Get storage files
+        const { data: storageFiles } = await supabaseAdmin.storage
+          .from('recordings')
+          .list(userId, { limit: 1000 });
+
+        if (!storageFiles || storageFiles.length === 0) continue;
+
+        // Get DB filenames
+        const { data: recordings } = await supabaseAdmin
+          .from('recordings')
+          .select('audio_url')
+          .eq('user_id', userId);
+
+        const dbFilenames = new Set();
+        (recordings || []).forEach(rec => {
+          if (rec.audio_url) {
+            const match = rec.audio_url.match(/\/([^\/]+)$/);
+            if (match) dbFilenames.add(match[1]);
+          }
+        });
+
+        // Find orphaned files
+        const orphanedFiles = [];
+        storageFiles.forEach(file => {
+          if (!dbFilenames.has(file.name)) {
+            orphanedFiles.push(`${userId}/${file.name}`);
+            totalBytesFreed += file.metadata?.size || 0;
+          }
+        });
+
+        // Delete orphaned files
+        if (orphanedFiles.length > 0) {
+          const { error: deleteError } = await supabaseAdmin.storage
+            .from('recordings')
+            .remove(orphanedFiles);
+
+          if (!deleteError) {
+            totalOrphaned += orphanedFiles.length;
+            console.log(`✅ [CRON] User ${userId}: Deleted ${orphanedFiles.length} orphaned files`);
+          }
+        }
+
+      } catch (userErr) {
+        console.error(`⚠️ [CRON] Error processing user ${userId}:`, userErr);
+      }
+    }
+
+    console.log(`🎉 [CRON] Global cleanup complete: ${totalOrphaned} files deleted, ${Math.round(totalBytesFreed / 1024 / 1024)} MB freed`);
+
+  } catch (err) {
+    console.error('❌ [CRON] Global cleanup error:', err);
+  }
+}
+
+// Schedule daily cleanup at 2 AM UTC
+setInterval(() => {
+  const now = new Date();
+  if (now.getUTCHours() === 2 && now.getUTCMinutes() === 0) {
+    cleanupOrphanedStorageGlobal();
+  }
+}, 60000); // Check every minute
+
 // Start server
 console.log('📍 About to call app.listen() on port', PORT);
 const server = app.listen(PORT, '0.0.0.0')
