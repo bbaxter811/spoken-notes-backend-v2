@@ -1183,8 +1183,8 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
         .eq('user_id', userId)
         .eq('status', 'completed')
         .not('transcription', 'is', null)
-        .order('created_at', { ascending: false })
-        .limit(5);
+        .order('created_at', { ascending: false });
+        // NO LIMIT - Chat can access ALL transcripts from Supabase
 
       if (recordings && recordings.length > 0) {
         context = recordings
