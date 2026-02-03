@@ -24,6 +24,7 @@ const multer = require('multer');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 const { v4: uuidv4 } = require('uuid');
+const sgMail = require('@sendgrid/mail');
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
@@ -410,6 +411,15 @@ app.post('/stripe/webhook', express.raw({ type: 'application/json' }), async (re
   res.json({ received: true });
 });
 
+// DIAGNOSTIC: Test send-email route (returns 401 if working, 404 if missing)
+app.get('/api/assistant/send-email/test', (req, res) => {
+  res.json({
+    message: 'send-email route exists',
+    status: 'Route is registered and working',
+    note: 'POST to this route requires authentication. This GET endpoint is for verification only.'
+  });
+});
+
 // JSON parsing for all other routes
 app.use(express.json());
 
@@ -436,6 +446,18 @@ try {
   console.log('✅ OpenAI client initialized');
 } catch (err) {
   console.error('⚠️  OpenAI initialization warning:', err.message);
+}
+
+// Initialize SendGrid for email sending
+if (process.env.SENDGRID_API_KEY) {
+  try {
+    sgMail.setApiKey(process.env.SENDGRID_API_KEY);
+    console.log('✅ SendGrid initialized');
+  } catch (err) {
+    console.error('⚠️  SendGrid initialization warning:', err.message);
+  }
+} else {
+  console.log('⚠️  SENDGRID_API_KEY not set - email sending disabled');
 }
 
 // Configure multer for file uploads (memory storage)
@@ -483,6 +505,39 @@ app.get('/health', (req, res) => {
   });
 });
 
+// DIAGNOSTIC: Routes verification endpoint
+app.get('/api/routes', (req, res) => {
+  const routes = [];
+  
+  // Extract all registered routes from Express
+  app._router.stack.forEach((middleware) => {
+    if (middleware.route) {
+      // Direct route
+      routes.push({
+        path: middleware.route.path,
+        methods: Object.keys(middleware.route.methods)
+      });
+    } else if (middleware.name === 'router') {
+      // Router middleware
+      middleware.handle.stack.forEach((handler) => {
+        if (handler.route) {
+          routes.push({
+            path: handler.route.path,
+            methods: Object.keys(handler.route.methods)
+          });
+        }
+      });
+    }
+  });
+  
+  res.json({
+    message: 'Registered routes',
+    count: routes.length,
+    routes: routes.sort((a, b) => a.path.localeCompare(b.path)),
+    assistantEmailRoute: routes.find(r => r.path === '/api/assistant/send-email') ? '✅ FOUND' : '❌ MISSING'
+  });
+});
+
 // PROTECTION 1: Rate limiting - in-memory tracker (resets on server restart)
 const testEndpointRateLimits = new Map(); // { ip: { count, resetAt } }
 const TEST_RATE_LIMIT = 20; // Max requests per IP per hour
@@ -507,16 +562,16 @@ app.post('/api/test/smoke', async (req, res) => {
   // PROTECTION 2: Check hard expiry first
   if (new Date() > TEST_ENDPOINT_EXPIRY) {
     console.error(`🚫 Test endpoint expired (after ${TEST_ENDPOINT_EXPIRY.toISOString()})`);
-    return res.status(410).json({ 
-      error: 'Test endpoint expired', 
-      message: 'This temporary endpoint is no longer available. Remove TEST_SECRET and test endpoint code.' 
+    return res.status(410).json({
+      error: 'Test endpoint expired',
+      message: 'This temporary endpoint is no longer available. Remove TEST_SECRET and test endpoint code.'
     });
   }
 
   // PROTECTION 1: Rate limiting
   const clientIp = req.ip || req.headers['x-forwarded-for'] || 'unknown';
   const now = Date.now();
-  
+
   let rateLimit = testEndpointRateLimits.get(clientIp);
   if (!rateLimit || now > rateLimit.resetAt) {
     // New window
@@ -525,12 +580,12 @@ app.post('/api/test/smoke', async (req, res) => {
   }
 
   rateLimit.count++;
-  
+
   if (rateLimit.count > TEST_RATE_LIMIT) {
     const resetIn = Math.ceil((rateLimit.resetAt - now) / 1000 / 60); // minutes
     console.warn(`⚠️ Rate limit exceeded for IP ${clientIp} (${rateLimit.count} requests)`);
-    return res.status(429).json({ 
-      error: 'Rate limit exceeded', 
+    return res.status(429).json({
+      error: 'Rate limit exceeded',
       message: `Too many requests. Try again in ${resetIn} minutes.`,
       retryAfter: resetIn * 60 // seconds
     });
@@ -763,10 +818,10 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
     // PHASE 3: Server-side storage limit enforcement (CRITICAL - fail-safe)
     // Active tiers: Free (100 MB) | Pro (5 GB)
     // Coming soon: Plus, Business (not enforced yet)
-    
+
     let storageLimit = 104857600; // 100 MB default for free tier
     let planTier = 'free';
-    
+
     try {
       const { data: subData, error: subError } = await supabaseAdmin
         .from('subscriptions')
@@ -779,7 +834,7 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
       } else if (subData && (subData.status === 'active' || subData.status === 'trialing')) {
         // Only Pro is enforced for now (Plus/Business coming soon)
         const priceId = subData.price_id;
-        
+
         if (priceId === process.env.STRIPE_PRICE_PRO) {
           storageLimit = 5368709120; // 5 GB for Pro
           planTier = 'pro';
@@ -807,9 +862,9 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
 
     if (usageError && usageError.code !== 'PGRST116') {
       console.error('❌ Failed to check storage usage:', usageError);
-      return res.status(500).json({ 
+      return res.status(500).json({
         code: 'STORAGE_CHECK_FAILED',
-        error: 'Unable to verify storage limit. Please try again.' 
+        error: 'Unable to verify storage limit. Please try again.'
       });
     }
 
@@ -830,7 +885,7 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
       });
     }
 
-    console.log(`✅ Storage check passed: ${newTotal} / ${storageLimit} bytes (${Math.round(newTotal/storageLimit*100)}% used)`);
+    console.log(`✅ Storage check passed: ${newTotal} / ${storageLimit} bytes (${Math.round(newTotal / storageLimit * 100)}% used)`);
 
     // 1. Upload audio to Supabase Storage
     const fileName = `${recordingId}-${Date.now()}.${req.file.originalname.split('.').pop()}`;
@@ -1113,7 +1168,7 @@ app.delete('/api/recordings/:id', authenticateUser, async (req, res) => {
         const { error: storageError } = await supabaseAdmin.storage
           .from('recordings')
           .remove([storageFilePath]);
-        
+
         if (storageError) {
           console.error('⚠️ Storage delete error (non-blocking):', storageError);
           // Don't fail the request - database record already deleted
@@ -1172,6 +1227,41 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
     const attitudeDesc = voiceAttitude === 'friendly' ? 'friendly and warm' : voiceAttitude === 'formal' ? 'professional and formal' : 'helpful and supportive';
     const personality = `You are ${assistantName}, a ${genderDesc} ${attitudeDesc} AI assistant.`;
 
+    // Assistant personality and role (Production Architecture)
+    const capabilities = `
+
+YOUR ROLE:
+You help the user draft, remember, and reflect. You do NOT execute actions - the app handles that.
+
+WHAT YOU DO:
+- Draft emails, texts, and notes
+- Summarize past recordings
+- Answer questions about recorded content
+- Narrate completed actions
+
+WHAT YOU DON'T DO:
+- Execute actions (app handles confirmation and execution)
+- Decide permissions or capabilities
+- Ask if you're "allowed" to do something
+
+IMPORTANT - Action Handling:
+When user requests an action (email, text, document):
+- The app will show a confirmation modal
+- The user will tap Send or Cancel
+- You will ONLY see the conversation again AFTER the action completes
+- At that point, narrate the outcome naturally
+
+FORBIDDEN PHRASES (NEVER SAY):
+❌ "I can't send emails"
+❌ "I don't have the ability"
+❌ "Here is a draft for you to review"
+❌ "Would you like me to send this?"
+
+You ARE connected to email, SMS, and file systems via the backend.
+The app handles user confirmation - not you.
+
+Be conversational, brief, and helpful.`;
+
     // Build context based on retrieval mode
     let context = '';
 
@@ -1184,7 +1274,7 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
         .eq('status', 'completed')
         .not('transcription', 'is', null)
         .order('created_at', { ascending: false });
-        // NO LIMIT - Chat can access ALL transcripts from Supabase
+      // NO LIMIT - Chat can access ALL transcripts from Supabase
 
       if (recordings && recordings.length > 0) {
         context = recordings
@@ -1196,12 +1286,12 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
     // Prepare system prompt based on mode
     let systemPrompt = '';
     if (retrievalMode === 'memory') {
-      systemPrompt = `${personality} You have access to the user's voice recordings. Use the following transcriptions to answer questions:\n\n${context || 'No recordings available yet.'}`;
+      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings. Use the following transcriptions to answer questions:\n\n${context || 'No recordings available yet.'}`;
     } else if (retrievalMode === 'web') {
-      systemPrompt = `${personality} Answer questions using your general knowledge and web information.`;
+      systemPrompt = `${personality}${capabilities} Answer questions using your general knowledge and web information.`;
     } else {
       // hybrid
-      systemPrompt = `${personality} You have access to the user's voice recordings and general knowledge. Use both to provide comprehensive answers.\n\nRecent recordings:\n${context || 'No recordings available yet.'}`;
+      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings and general knowledge. Use both to provide comprehensive answers.\n\nRecent recordings:\n${context || 'No recordings available yet.'}`;
     }
 
     // Build messages array with conversation history
@@ -1211,12 +1301,12 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
       { role: 'user', content: message }
     ];
 
-    // Call OpenAI Chat API
+    // Call OpenAI Chat API with GPT-4o (faster, better conversational, cheaper)
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4',
+      model: 'gpt-4o',
       messages: messages,
       temperature: 0.7,
-      max_tokens: 500,
+      max_tokens: 50, // ULTRA REDUCED - force 1-word responses for actions
     });
 
     const response = completion.choices[0].message.content;
@@ -1533,6 +1623,436 @@ app.post('/api/tts', authenticateUser, async (req, res) => {
 });
 
 // ============================================================================
+// ASSISTANT ACTIONS - File Creation & Communication (Phase 3)
+// ============================================================================
+
+/**
+ * POST /api/assistant/create-excel
+ * Creates an Excel file from structured data
+ */
+app.post('/api/assistant/create-excel', authenticateUser, async (req, res) => {
+  try {
+    const { filename, data, content } = req.body;
+    const userId = req.user.id;
+
+    if (!filename) {
+      return res.status(400).json({ error: 'Filename is required' });
+    }
+
+    const ExcelJS = require('exceljs');
+    const workbook = new ExcelJS.Workbook();
+    const worksheet = workbook.addWorksheet('Sheet1');
+
+    // If structured data provided, use it
+    if (data && Array.isArray(data)) {
+      // Assume data is array of objects
+      const headers = Object.keys(data[0] || {});
+      worksheet.addRow(headers);
+      data.forEach(row => {
+        worksheet.addRow(Object.values(row));
+      });
+    } else if (content) {
+      // Parse content as simple text rows
+      const rows = content.split('\n').map(line => [line]);
+      rows.forEach(row => worksheet.addRow(row));
+    } else {
+      worksheet.addRow(['Sample Data']);
+    }
+
+    // Generate buffer
+    const buffer = await workbook.xlsx.writeBuffer();
+
+    // Store in Supabase storage
+    const filePath = `${userId}/assistant/${filename}`;
+    const { data: uploadData, error: uploadError } = await supabaseAdmin.storage
+      .from('assistant-files')
+      .upload(filePath, buffer, {
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        upsert: true
+      });
+
+    if (uploadError) {
+      console.error('Excel upload error:', uploadError);
+      return res.status(500).json({ error: 'Failed to save Excel file' });
+    }
+
+    // Get public URL
+    const { data: urlData } = supabaseAdmin.storage
+      .from('assistant-files')
+      .getPublicUrl(filePath);
+
+    console.log(`✅ Excel file created: ${filename} for user ${userId}`);
+
+    res.json({
+      success: true,
+      filename,
+      url: urlData.publicUrl,
+      path: filePath
+    });
+  } catch (error) {
+    console.error('Error creating Excel file:', error);
+    res.status(500).json({ error: 'Failed to create Excel file', details: error.message });
+  }
+});
+
+/**
+ * POST /api/assistant/create-pdf
+ * Creates a PDF document from text content
+ */
+app.post('/api/assistant/create-pdf', authenticateUser, async (req, res) => {
+  try {
+    const { filename, content, title } = req.body;
+    const userId = req.user.id;
+
+    if (!filename || !content) {
+      return res.status(400).json({ error: 'Filename and content are required' });
+    }
+
+    const PDFDocument = require('pdfkit');
+    const chunks = [];
+    
+    const doc = new PDFDocument();
+    
+    // Collect chunks
+    doc.on('data', chunk => chunks.push(chunk));
+    
+    // Create PDF content
+    if (title) {
+      doc.fontSize(20).text(title, { align: 'center' });
+      doc.moveDown();
+    }
+    
+    doc.fontSize(12).text(content, {
+      align: 'left',
+      lineGap: 5
+    });
+    
+    doc.end();
+
+    // Wait for completion
+    await new Promise((resolve, reject) => {
+      doc.on('end', resolve);
+      doc.on('error', reject);
+    });
+
+    const buffer = Buffer.concat(chunks);
+
+    // Store in Supabase storage
+    const filePath = `${userId}/assistant/${filename}`;
+    const { data: uploadData, error: uploadError } = await supabaseAdmin.storage
+      .from('assistant-files')
+      .upload(filePath, buffer, {
+        contentType: 'application/pdf',
+        upsert: true
+      });
+
+    if (uploadError) {
+      console.error('PDF upload error:', uploadError);
+      return res.status(500).json({ error: 'Failed to save PDF file' });
+    }
+
+    // Get public URL
+    const { data: urlData } = supabaseAdmin.storage
+      .from('assistant-files')
+      .getPublicUrl(filePath);
+
+    console.log(`✅ PDF file created: ${filename} for user ${userId}`);
+
+    res.json({
+      success: true,
+      filename,
+      url: urlData.publicUrl,
+      path: filePath
+    });
+  } catch (error) {
+    console.error('Error creating PDF file:', error);
+    res.status(500).json({ error: 'Failed to create PDF file', details: error.message });
+  }
+});
+
+/**
+ * POST /api/assistant/create-word
+ * Creates a Word document (.docx) from text content
+ */
+app.post('/api/assistant/create-word', authenticateUser, async (req, res) => {
+  try {
+    const { filename, content, title } = req.body;
+    const userId = req.user.id;
+
+    if (!filename || !content) {
+      return res.status(400).json({ error: 'Filename and content are required' });
+    }
+
+    const { Document, Packer, Paragraph, TextRun, HeadingLevel } = require('docx');
+
+    const paragraphs = [];
+
+    // Add title if provided
+    if (title) {
+      paragraphs.push(
+        new Paragraph({
+          text: title,
+          heading: HeadingLevel.HEADING_1,
+        })
+      );
+    }
+
+    // Split content into paragraphs
+    const contentLines = content.split('\n').filter(line => line.trim());
+    contentLines.forEach(line => {
+      paragraphs.push(
+        new Paragraph({
+          children: [new TextRun(line)],
+        })
+      );
+    });
+
+    const doc = new Document({
+      sections: [{
+        children: paragraphs,
+      }],
+    });
+
+    const buffer = await Packer.toBuffer(doc);
+
+    // Store in Supabase storage
+    const filePath = `${userId}/assistant/${filename}`;
+    const { data: uploadData, error: uploadError } = await supabaseAdmin.storage
+      .from('assistant-files')
+      .upload(filePath, buffer, {
+        contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        upsert: true
+      });
+
+    if (uploadError) {
+      console.error('Word upload error:', uploadError);
+      return res.status(500).json({ error: 'Failed to save Word file' });
+    }
+
+    // Get public URL
+    const { data: urlData } = supabaseAdmin.storage
+      .from('assistant-files')
+      .getPublicUrl(filePath);
+
+    console.log(`✅ Word file created: ${filename} for user ${userId}`);
+
+    res.json({
+      success: true,
+      filename,
+      fileUrl: urlData.publicUrl
+    });
+  } catch (error) {
+    console.error('Error creating Word file:', error);
+    res.status(500).json({ error: 'Failed to create Word file', details: error.message });
+  }
+});
+
+/**
+ * POST /api/assistant/send-email
+ * Sends an email via SendGrid (provider-based)
+ * From: noreply@thebaxgroupllc.com (verified sender)
+ * Reply-To: user's email address
+ */
+app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
+  try {
+    const { recipient, subject, content } = req.body;
+    const userId = req.user.id;
+    const userEmail = req.user.email;
+
+    if (!recipient || !content) {
+      return res.status(400).json({ error: 'Recipient and content are required' });
+    }
+
+    // Handle "SELF" marker - send to user's own email
+    const actualRecipient = recipient === 'SELF' ? userEmail : recipient;
+    console.log(`📧 Email recipient resolved: ${recipient} → ${actualRecipient}`);
+
+    // Check if SendGrid is configured
+    if (!process.env.SENDGRID_API_KEY || !process.env.SENDGRID_FROM_EMAIL) {
+      console.warn('⚠️ Email not configured - SENDGRID_API_KEY and SENDGRID_FROM_EMAIL required');
+      return res.status(503).json({ 
+        error: 'Email service not configured',
+        draft: true // Signal that email was drafted but not sent
+      });
+    }
+
+    const emailId = uuidv4();
+    const fromEmail = process.env.SENDGRID_FROM_EMAIL; // e.g., assistant@spokennotes.com
+
+    const msg = {
+      to: actualRecipient,
+      from: fromEmail,
+      replyTo: userEmail, // Replies go to the user
+      subject: subject || 'Message from Spoken Notes',
+      text: content,
+      html: content.replace(/\n/g, '<br>'), // Simple HTML formatting
+    };
+
+    console.log(`📧 Sending email from ${fromEmail} to ${actualRecipient} (reply-to: ${userEmail})`);
+
+    const response = await sgMail.send(msg);
+    const messageId = response[0].headers['x-message-id'];
+
+    console.log(`✅ Email sent: ${messageId}`);
+
+    // Log to Supabase
+    await supabaseAdmin
+      .from('email_logs')
+      .insert({
+        id: emailId,
+        user_id: userId,
+        to_email: recipient,
+        from_email: fromEmail,
+        reply_to: userEmail,
+        subject: msg.subject,
+        body: content,
+        status: 'sent',
+        provider: 'sendgrid',
+        provider_message_id: messageId,
+        sent_at: new Date().toISOString()
+      });
+
+    res.json({
+      success: true,
+      messageId,
+      recipient
+    });
+  } catch (error) {
+    console.error('Error sending email:', error);
+    console.error('❌ SendGrid error details:', {
+      message: error.message,
+      code: error.code,
+      statusCode: error.response?.statusCode,
+      body: error.response?.body
+    });
+    
+    // Log failure to Supabase
+    try {
+      await supabaseAdmin
+        .from('email_logs')
+        .insert({
+          id: uuidv4(),
+          user_id: req.user.id,
+          to_email: req.body.recipient,
+          from_email: process.env.SENDGRID_FROM_EMAIL,
+          reply_to: req.user.email,
+          subject: req.body.subject || 'Message from Spoken Notes',
+          body: req.body.content,
+          status: 'failed',
+          provider: 'sendgrid',
+          error_message: error.message,
+          sent_at: new Date().toISOString()
+        });
+    } catch (logError) {
+      console.error('Failed to log email error:', logError);
+    }
+
+    res.status(500).json({ 
+      error: 'Failed to send email', 
+      details: error.response?.body?.errors?.[0]?.message || error.message 
+    });
+  }
+});
+
+/**
+ * POST /api/assistant/send-sms
+ * Sends an SMS via Twilio
+ * REQUIRES: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER environment variables
+ */
+app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
+  try {
+    const { recipient, content } = req.body;
+    const userId = req.user.id;
+
+    if (!recipient || !content) {
+      return res.status(400).json({ error: 'Recipient and content are required' });
+    }
+
+    // Check if Twilio is configured
+    if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
+      console.warn('⚠️ SMS not configured - TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER required');
+      return res.status(503).json({ error: 'SMS service not configured' });
+    }
+
+    const twilio = require('twilio');
+    const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+    const message = await client.messages.create({
+      body: content,
+      from: process.env.TWILIO_PHONE_NUMBER,
+      to: recipient
+    });
+
+    console.log(`✅ SMS sent: ${message.sid} to ${recipient} for user ${userId}`);
+
+    res.json({
+      success: true,
+      messageSid: message.sid,
+      recipient
+    });
+  } catch (error) {
+    console.error('Error sending SMS:', error);
+    res.status(500).json({ error: 'Failed to send SMS', details: error.message });
+  }
+});
+
+/**
+ * POST /api/assistant/create-note
+ * Creates a note/summary similar to recording transcripts
+ * Saves to database like recordings
+ */
+app.post('/api/assistant/create-note', authenticateUser, async (req, res) => {
+  try {
+    const { title, content } = req.body;
+    const userId = req.user.id;
+
+    if (!content) {
+      return res.status(400).json({ error: 'Content is required' });
+    }
+
+    const noteId = uuidv4();
+    const noteTitle = title || `Note ${new Date().toLocaleDateString()}`;
+
+    console.log(`📝 Creating note for user ${userId}: "${noteTitle}"`);
+
+    // Insert note into recordings table (reusing existing structure)
+    const { data: noteData, error: insertError } = await supabaseAdmin
+      .from('recordings')
+      .insert({
+        id: noteId,
+        user_id: userId,
+        audio_url: null, // No audio for text notes
+        duration_seconds: 0,
+        transcription: content,
+        status: 'completed',
+        created_at: new Date().toISOString()
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error('Note creation error:', insertError);
+      return res.status(500).json({ error: 'Failed to save note' });
+    }
+
+    console.log(`✅ Note created: ${noteId} for user ${userId}`);
+
+    res.json({
+      success: true,
+      note: {
+        id: noteData.id,
+        title: noteTitle,
+        content: noteData.transcription,
+        created_at: noteData.created_at
+      }
+    });
+  } catch (error) {
+    console.error('Error creating note:', error);
+    res.status(500).json({ error: 'Failed to create note', details: error.message });
+  }
+});
+
+// ============================================================================
 // BILLING/METERING ENDPOINTS
 // ============================================================================
 
@@ -1740,11 +2260,11 @@ app.post('/api/billing/cleanup-orphaned-storage', authenticateUser, async (req, 
 
     if (!storageFiles || storageFiles.length === 0) {
       console.log('✅ No files in storage for this user');
-      return res.json({ 
-        success: true, 
-        orphaned_count: 0, 
+      return res.json({
+        success: true,
+        orphaned_count: 0,
         bytes_freed: 0,
-        message: 'No files found in storage' 
+        message: 'No files found in storage'
       });
     }
 
@@ -1785,11 +2305,11 @@ app.post('/api/billing/cleanup-orphaned-storage', authenticateUser, async (req, 
 
     if (orphanedFiles.length === 0) {
       console.log('✅ No orphaned files found - storage is clean');
-      return res.json({ 
-        success: true, 
-        orphaned_count: 0, 
+      return res.json({
+        success: true,
+        orphaned_count: 0,
         bytes_freed: 0,
-        message: 'Storage is already clean - no orphaned files' 
+        message: 'Storage is already clean - no orphaned files'
       });
     }
 
@@ -1922,6 +2442,13 @@ const server = app.listen(PORT, '0.0.0.0')
     console.log(`🚀 Backend V2 running on http://0.0.0.0:${PORT}`);
     console.log(`📝 Health: http://localhost:${PORT}/health`);
     console.log('✅ Server is listening, event loop active');
+  })
+  .on('listening', () => {
+    console.log(`✅ Server running on port ${PORT}`);
+    console.log(`🔗 Health check: http://localhost:${PORT}/health`);
+    console.log(`🔗 Routes list: http://localhost:${PORT}/api/routes`);
+    console.log(`📧 Email route: POST /api/assistant/send-email (requires auth)`);
+    console.log(`🔍 Test route: GET /api/assistant/send-email/test (no auth)`);
   })
   .on('error', (err) => {
     console.error('❌ Server startup error:', err);
