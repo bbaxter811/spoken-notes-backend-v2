@@ -2441,14 +2441,10 @@ const server = app.listen(PORT, '0.0.0.0')
   .on('listening', () => {
     console.log(`🚀 Backend V2 running on http://0.0.0.0:${PORT}`);
     console.log(`📝 Health: http://localhost:${PORT}/health`);
-    console.log('✅ Server is listening, event loop active');
-  })
-  .on('listening', () => {
-    console.log(`✅ Server running on port ${PORT}`);
-    console.log(`🔗 Health check: http://localhost:${PORT}/health`);
     console.log(`🔗 Routes list: http://localhost:${PORT}/api/routes`);
     console.log(`📧 Email route: POST /api/assistant/send-email (requires auth)`);
     console.log(`🔍 Test route: GET /api/assistant/send-email/test (no auth)`);
+    console.log('✅ Server is listening, event loop active');
   })
   .on('error', (err) => {
     console.error('❌ Server startup error:', err);
