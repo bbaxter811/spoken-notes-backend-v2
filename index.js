@@ -507,35 +507,42 @@ app.get('/health', (req, res) => {
 
 // DIAGNOSTIC: Routes verification endpoint
 app.get('/api/routes', (req, res) => {
-  const routes = [];
-  
-  // Extract all registered routes from Express
-  app._router.stack.forEach((middleware) => {
-    if (middleware.route) {
-      // Direct route
-      routes.push({
-        path: middleware.route.path,
-        methods: Object.keys(middleware.route.methods)
-      });
-    } else if (middleware.name === 'router') {
-      // Router middleware
-      middleware.handle.stack.forEach((handler) => {
-        if (handler.route) {
+  try {
+    const routes = [];
+    
+    // Extract all registered routes from Express
+    if (app._router && app._router.stack) {
+      app._router.stack.forEach((middleware) => {
+        if (middleware.route) {
+          // Direct route
           routes.push({
-            path: handler.route.path,
-            methods: Object.keys(handler.route.methods)
+            path: middleware.route.path,
+            methods: Object.keys(middleware.route.methods)
+          });
+        } else if (middleware.name === 'router' && middleware.handle && middleware.handle.stack) {
+          // Router middleware
+          middleware.handle.stack.forEach((handler) => {
+            if (handler.route) {
+              routes.push({
+                path: handler.route.path,
+                methods: Object.keys(handler.route.methods)
+              });
+            }
           });
         }
       });
     }
-  });
-  
-  res.json({
-    message: 'Registered routes',
-    count: routes.length,
-    routes: routes.sort((a, b) => a.path.localeCompare(b.path)),
-    assistantEmailRoute: routes.find(r => r.path === '/api/assistant/send-email') ? '✅ FOUND' : '❌ MISSING'
-  });
+    
+    res.json({
+      message: 'Registered routes',
+      count: routes.length,
+      routes: routes.sort((a, b) => a.path.localeCompare(b.path)),
+      assistantEmailRoute: routes.find(r => r.path === '/api/assistant/send-email') ? '✅ FOUND' : '❌ MISSING'
+    });
+  } catch (error) {
+    console.error('Error listing routes:', error);
+    res.status(500).json({ error: 'Failed to list routes', message: error.message });
+  }
 });
 
 // PROTECTION 1: Rate limiting - in-memory tracker (resets on server restart)
