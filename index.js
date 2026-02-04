@@ -1861,22 +1861,30 @@ app.post('/api/assistant/create-word', authenticateUser, async (req, res) => {
  * Reply-To: user's email address
  */
 app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
+  // PHASE 1 CHECKPOINT 1: Route Hit
+  const requestId = req.headers['x-request-id'] || req.body.request_id || `backend-${Date.now()}`;
+  console.log(`[EMAIL] HIT_SEND_EMAIL request_id=${requestId} user_id=${req.user?.id} ip=${req.ip}`);
+  
   try {
     const { recipient, subject, content } = req.body;
     const userId = req.user.id;
     const userEmail = req.user.email;
 
+    // PHASE 1 CHECKPOINT 2: Auth OK
+    console.log(`[EMAIL] AUTH_OK request_id=${requestId} user_id=${userId} user_email=${userEmail}`);
+
     if (!recipient || !content) {
+      console.log(`[EMAIL] VALIDATION_FAILED request_id=${requestId} missing_fields=${!recipient ? 'recipient' : 'content'}`);
       return res.status(400).json({ error: 'Recipient and content are required' });
     }
 
     // Handle "SELF" marker - send to user's own email
     const actualRecipient = recipient === 'SELF' ? userEmail : recipient;
-    console.log(`📧 Email recipient resolved: ${recipient} → ${actualRecipient}`);
+    console.log(`[EMAIL] RECIPIENT_RESOLVED request_id=${requestId} input=${recipient} resolved=${actualRecipient}`);
 
     // Check if SendGrid is configured
     if (!process.env.SENDGRID_API_KEY || !process.env.SENDGRID_FROM_EMAIL) {
-      console.warn('⚠️ Email not configured - SENDGRID_API_KEY and SENDGRID_FROM_EMAIL required');
+      console.warn(`[EMAIL] SENDGRID_NOT_CONFIGURED request_id=${requestId}`);
       return res.status(503).json({ 
         error: 'Email service not configured',
         draft: true // Signal that email was drafted but not sent
@@ -1895,12 +1903,13 @@ app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
       html: content.replace(/\n/g, '<br>'), // Simple HTML formatting
     };
 
-    console.log(`📧 Sending email from ${fromEmail} to ${actualRecipient} (reply-to: ${userEmail})`);
+    console.log(`[EMAIL] CALLING_SENDGRID request_id=${requestId} from=${fromEmail} to=${actualRecipient}`);
 
     const response = await sgMail.send(msg);
     const messageId = response[0].headers['x-message-id'];
 
-    console.log(`✅ Email sent: ${messageId}`);
+    // PHASE 1 CHECKPOINT 3: SendGrid Result
+    console.log(`[EMAIL] SENDGRID_RESULT request_id=${requestId} status=accepted msg_id=${messageId}`);
 
     // Log to Supabase
     await supabaseAdmin
@@ -1916,17 +1925,23 @@ app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
         status: 'sent',
         provider: 'sendgrid',
         provider_message_id: messageId,
+        request_id: requestId, // PHASE 1: Store request_id
         sent_at: new Date().toISOString()
       });
+
+    console.log(`[EMAIL] DB_LOGGED request_id=${requestId} email_log_id=${emailId}`);
 
     res.json({
       success: true,
       messageId,
-      recipient
+      recipient,
+      requestId // PHASE 1: Return request_id to client
     });
   } catch (error) {
-    console.error('Error sending email:', error);
-    console.error('❌ SendGrid error details:', {
+    // PHASE 1 CHECKPOINT 3: SendGrid Error
+    console.error(`[EMAIL] SENDGRID_RESULT request_id=${requestId} status=rejected error=${error.message}`);
+    console.error('[EMAIL] ERROR_DETAILS:', {
+      request_id: requestId,
       message: error.message,
       code: error.code,
       statusCode: error.response?.statusCode,
@@ -1948,6 +1963,7 @@ app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
           status: 'failed',
           provider: 'sendgrid',
           error_message: error.message,
+          request_id: requestId, // PHASE 1: Store request_id even on failure
           sent_at: new Date().toISOString()
         });
     } catch (logError) {
