@@ -509,7 +509,7 @@ app.get('/health', (req, res) => {
 app.get('/api/routes', (req, res) => {
   try {
     const routes = [];
-    
+
     // Extract all registered routes from Express
     if (app._router && app._router.stack) {
       app._router.stack.forEach((middleware) => {
@@ -532,7 +532,7 @@ app.get('/api/routes', (req, res) => {
         }
       });
     }
-    
+
     res.json({
       message: 'Registered routes',
       count: routes.length,
@@ -1251,23 +1251,33 @@ WHAT YOU DON'T DO:
 - Decide permissions or capabilities
 - Ask if you're "allowed" to do something
 
-IMPORTANT - Action Handling:
-When user requests an action (email, text, document):
-- The app will show a confirmation modal
-- The user will tap Send or Cancel
-- You will ONLY see the conversation again AFTER the action completes
-- At that point, narrate the outcome naturally
+CRITICAL - Email/SMS Action Protocol:
+When user requests to send email or SMS:
+1. Extract FULL recipient name/email accurately (e.g., "Brian Baxter", "john@example.com")
+2. Respond: "I'll send [TYPE] to [FULL NAME/EMAIL] saying: [MESSAGE]. Ready to send?"
+3. Wait for user confirmation
+4. NEVER say action completed until AFTER user confirms
 
-FORBIDDEN PHRASES (NEVER SAY):
-❌ "I can't send emails"
-❌ "I don't have the ability"
-❌ "Here is a draft for you to review"
-❌ "Would you like me to send this?"
+Examples:
+✅ User: "Send email to Brian Baxter saying hello"
+   You: "I'll send an email to Brian Baxter saying: hello. Ready to send?"
+   
+✅ User: "Email me saying test"
+   You: "I'll send an email to yourself saying: test. Ready to send?"
+
+✅ User: "Send text to John saying I'm running late"
+   You: "I'll send a text to John saying: I'm running late. Ready to send?"
+
+FORBIDDEN (Never say these):
+❌ "The email has been sent" (before user confirms)
+❌ "Email sent successfully" (before confirmation)
+❌ "I can't send emails" (you CAN via backend)
+
+After user says "send"/"confirm", the action executes and you'll see the result.
+Then you can say: "Sent!"
 
 You ARE connected to email, SMS, and file systems via the backend.
-The app handles user confirmation - not you.
-
-Be conversational, brief, and helpful.`;
+Be conversational, accurate with names/recipients, and wait for confirmation.`;
 
     // Build context based on retrieval mode
     let context = '';
@@ -1313,7 +1323,7 @@ Be conversational, brief, and helpful.`;
       model: 'gpt-4o',
       messages: messages,
       temperature: 0.7,
-      max_tokens: 50, // ULTRA REDUCED - force 1-word responses for actions
+      max_tokens: 150, // Enough for confirmation prompts + recipient extraction
     });
 
     const response = completion.choices[0].message.content;
@@ -1717,23 +1727,23 @@ app.post('/api/assistant/create-pdf', authenticateUser, async (req, res) => {
 
     const PDFDocument = require('pdfkit');
     const chunks = [];
-    
+
     const doc = new PDFDocument();
-    
+
     // Collect chunks
     doc.on('data', chunk => chunks.push(chunk));
-    
+
     // Create PDF content
     if (title) {
       doc.fontSize(20).text(title, { align: 'center' });
       doc.moveDown();
     }
-    
+
     doc.fontSize(12).text(content, {
       align: 'left',
       lineGap: 5
     });
-    
+
     doc.end();
 
     // Wait for completion
@@ -1864,7 +1874,7 @@ app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
   // PHASE 1 CHECKPOINT 1: Route Hit
   const requestId = req.headers['x-request-id'] || req.body.request_id || `backend-${Date.now()}`;
   console.log(`[EMAIL] HIT_SEND_EMAIL request_id=${requestId} user_id=${req.user?.id} ip=${req.ip}`);
-  
+
   try {
     const { recipient, subject, content } = req.body;
     const userId = req.user.id;
@@ -1885,7 +1895,7 @@ app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
     // Check if SendGrid is configured
     if (!process.env.SENDGRID_API_KEY || !process.env.SENDGRID_FROM_EMAIL) {
       console.warn(`[EMAIL] SENDGRID_NOT_CONFIGURED request_id=${requestId}`);
-      return res.status(503).json({ 
+      return res.status(503).json({
         error: 'Email service not configured',
         draft: true // Signal that email was drafted but not sent
       });
@@ -1947,7 +1957,7 @@ app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
       statusCode: error.response?.statusCode,
       body: error.response?.body
     });
-    
+
     // Log failure to Supabase
     try {
       await supabaseAdmin
@@ -1970,9 +1980,9 @@ app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
       console.error('Failed to log email error:', logError);
     }
 
-    res.status(500).json({ 
-      error: 'Failed to send email', 
-      details: error.response?.body?.errors?.[0]?.message || error.message 
+    res.status(500).json({
+      error: 'Failed to send email',
+      details: error.response?.body?.errors?.[0]?.message || error.message
     });
   }
 });
