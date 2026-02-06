@@ -1217,7 +1217,8 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
       assistantName = 'Assistant',
       voiceGender = 'female',
       voiceAttitude = 'helpful',
-      conversationHistory = [] // NEW: Accept conversation history from client
+      conversationHistory = [], // Accept conversation history from client
+      contacts = [] // NEW: Accept user's contacts for AI queries
     } = req.body;
     const userId = req.user.id;
 
@@ -1228,6 +1229,7 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
     console.log(`💬 Chat request from user ${userId}, mode: ${retrievalMode}`);
     console.log('   Personality -> Name: ' + assistantName + ', Gender: ' + voiceGender + ', Attitude: ' + voiceAttitude);
     console.log('   Conversation history: ' + conversationHistory.length + ' messages');
+    console.log('   Contacts provided: ' + contacts.length + ' contacts');
 
     // Build personality description
     const genderDesc = voiceGender === 'male' ? 'male' : 'female';
@@ -1251,13 +1253,21 @@ WHAT YOU DON'T DO:
 - Decide permissions or capabilities
 - Ask if you're "allowed" to do something
 
-CONTACT ACCESS (Be Honest):
-When drafting emails/SMS, you CAN use contact names (e.g., "Guy Hendrickson") - the app will automatically resolve them to email addresses behind the scenes.
+CONTACT ACCESS:
+You HAVE FULL ACCESS to the user's contacts. When user asks for contact information, provide it directly.
 
-However, you CANNOT directly query or list contact information. If user asks "What is John's email?" respond honestly:
-"I can use contact names when sending emails or texts, and the app will look them up for you. But I can't directly tell you what someone's email or phone number is - you'd need to check your contacts app for that."
+Examples:
+✅ User: "What is Guy Hendrickson's email?"
+   You: "Guy Hendrickson's email is assegaih@hotmail.com"
 
-Be transparent about what the app does vs what you can access directly.
+✅ User: "Do I have John's phone number?"
+   You: "Yes, John Smith's phone is 555-1234"
+
+✅ User: "What company does Sarah work for?"
+   You: "Sarah Johnson works at Acme Corp"
+
+When drafting emails/SMS, you can use contact names AND answer contact queries directly.
+Be helpful and informative about contact details.
 
 CRITICAL - Email/SMS Action Protocol:
 When user requests to send email or SMS:
@@ -1276,19 +1286,16 @@ Examples:
 ✅ User: "Send text to John saying I'm running late"
    You: "I'll send a text to John saying: I'm running late. Ready to send?"
 
-✅ User: "What is Guy Hendrickson's email?"
-   You: "I can use his name when sending emails and the app will look it up, but I can't directly tell you contact details. Check your contacts app to see his email address."
-
 FORBIDDEN (Never say these):
 ❌ "The email has been sent" (before user confirms)
 ❌ "Email sent successfully" (before confirmation)
 ❌ "I can't send emails" (you CAN via backend)
-❌ "I don't have access to contacts" (you DO when drafting - be honest about HOW)
+❌ "I don't have access to contacts" (you DO have full access)
 
 After user says "send"/"confirm", the action executes and you'll see the result.
 Then you can say: "Sent!"
 
-You ARE connected to email, SMS, and file systems via the backend.
+You ARE connected to email, SMS, contacts, and file systems via the backend.
 Be conversational, accurate with names/recipients, and wait for confirmation.`;
 
     // Build context based on retrieval mode
@@ -1312,15 +1319,28 @@ Be conversational, accurate with names/recipients, and wait for confirmation.`;
       }
     }
 
+    // Format contacts for AI (compact JSON format to save tokens)
+    let contactsContext = '';
+    if (contacts && contacts.length > 0) {
+      contactsContext = '\n\nUSER CONTACTS:\n' + contacts.map(c => {
+        const parts = [`${c.name}`];
+        if (c.email) parts.push(`email: ${c.email}`);
+        if (c.phone) parts.push(`phone: ${c.phone}`);
+        if (c.company) parts.push(`company: ${c.company}`);
+        return parts.join(' | ');
+      }).join('\n');
+      console.log(`   📇 Added ${contacts.length} contacts to AI context`);
+    }
+
     // Prepare system prompt based on mode
     let systemPrompt = '';
     if (retrievalMode === 'memory') {
-      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings. Use the following transcriptions to answer questions:\n\n${context || 'No recordings available yet.'}`;
+      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings. Use the following transcriptions to answer questions:\n\n${context || 'No recordings available yet.'}${contactsContext}`;
     } else if (retrievalMode === 'web') {
-      systemPrompt = `${personality}${capabilities} Answer questions using your general knowledge and web information.`;
+      systemPrompt = `${personality}${capabilities} Answer questions using your general knowledge and web information.${contactsContext}`;
     } else {
       // hybrid
-      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings and general knowledge. Use both to provide comprehensive answers.\n\nRecent recordings:\n${context || 'No recordings available yet.'}`;
+      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings and general knowledge. Use both to provide comprehensive answers.\n\nRecent recordings:\n${context || 'No recordings available yet.'}${contactsContext}`;
     }
 
     // Build messages array with conversation history
