@@ -1217,8 +1217,7 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
       assistantName = 'Assistant',
       voiceGender = 'female',
       voiceAttitude = 'helpful',
-      conversationHistory = [], // Accept conversation history from client
-      contacts = [] // NEW: Accept user's contacts for AI queries
+      conversationHistory = [] // Accept conversation history from client
     } = req.body;
     const userId = req.user.id;
 
@@ -1229,7 +1228,6 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
     console.log(`💬 Chat request from user ${userId}, mode: ${retrievalMode}`);
     console.log('   Personality -> Name: ' + assistantName + ', Gender: ' + voiceGender + ', Attitude: ' + voiceAttitude);
     console.log('   Conversation history: ' + conversationHistory.length + ' messages');
-    console.log('   Contacts provided: ' + contacts.length + ' contacts');
 
     // Build personality description
     const genderDesc = voiceGender === 'male' ? 'male' : 'female';
@@ -1253,21 +1251,11 @@ WHAT YOU DON'T DO:
 - Decide permissions or capabilities
 - Ask if you're "allowed" to do something
 
-CONTACT ACCESS:
-You HAVE FULL ACCESS to the user's contacts. When user asks for contact information, provide it directly.
+CONTACT INFORMATION:
+When user asks about contact details (email, phone, address, birthday), be honest:
+"I'll need to look that up in your contacts. Let me check for you."
 
-Examples:
-✅ User: "What is Guy Hendrickson's email?"
-   You: "Guy Hendrickson's email is assegaih@hotmail.com"
-
-✅ User: "Do I have John's phone number?"
-   You: "Yes, John Smith's phone is 555-1234"
-
-✅ User: "What company does Sarah work for?"
-   You: "Sarah Johnson works at Acme Corp"
-
-When drafting emails/SMS, you can use contact names AND answer contact queries directly.
-Be helpful and informative about contact details.
+Then the app will provide the information, and you can relay it back.
 
 CRITICAL - Email/SMS Action Protocol:
 When user requests to send email or SMS:
@@ -1290,12 +1278,12 @@ FORBIDDEN (Never say these):
 ❌ "The email has been sent" (before user confirms)
 ❌ "Email sent successfully" (before confirmation)
 ❌ "I can't send emails" (you CAN via backend)
-❌ "I don't have access to contacts" (you DO have full access)
 
 After user says "send"/"confirm", the action executes and you'll see the result.
 Then you can say: "Sent!"
 
-You ARE connected to email, SMS, contacts, and file systems via the backend.
+You ARE connected to email, SMS, and file systems via the backend.
+The app handles contact lookups when needed.
 Be conversational, accurate with names/recipients, and wait for confirmation.`;
 
     // Build context based on retrieval mode
@@ -1309,7 +1297,7 @@ Be conversational, accurate with names/recipients, and wait for confirmation.`;
         .eq('user_id', userId)
         .eq('status', 'completed')
         .not('transcription', 'is', null)
-        .order('created_at', { ascending: false });
+        .order('created_at', { ascending: false});
       // NO LIMIT - Chat can access ALL transcripts from Supabase
 
       if (recordings && recordings.length > 0) {
@@ -1319,28 +1307,15 @@ Be conversational, accurate with names/recipients, and wait for confirmation.`;
       }
     }
 
-    // Format contacts for AI (compact JSON format to save tokens)
-    let contactsContext = '';
-    if (contacts && contacts.length > 0) {
-      contactsContext = '\n\nUSER CONTACTS:\n' + contacts.map(c => {
-        const parts = [`${c.name}`];
-        if (c.email) parts.push(`email: ${c.email}`);
-        if (c.phone) parts.push(`phone: ${c.phone}`);
-        if (c.company) parts.push(`company: ${c.company}`);
-        return parts.join(' | ');
-      }).join('\n');
-      console.log(`   📇 Added ${contacts.length} contacts to AI context`);
-    }
-
     // Prepare system prompt based on mode
     let systemPrompt = '';
     if (retrievalMode === 'memory') {
-      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings. Use the following transcriptions to answer questions:\n\n${context || 'No recordings available yet.'}${contactsContext}`;
+      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings. Use the following transcriptions to answer questions:\n\n${context || 'No recordings available yet.'}`;
     } else if (retrievalMode === 'web') {
-      systemPrompt = `${personality}${capabilities} Answer questions using your general knowledge and web information.${contactsContext}`;
+      systemPrompt = `${personality}${capabilities} Answer questions using your general knowledge and web information.`;
     } else {
       // hybrid
-      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings and general knowledge. Use both to provide comprehensive answers.\n\nRecent recordings:\n${context || 'No recordings available yet.'}${contactsContext}`;
+      systemPrompt = `${personality}${capabilities} You have access to the user's voice recordings and general knowledge. Use both to provide comprehensive answers.\n\nRecent recordings:\n${context || 'No recordings available yet.'}`;
     }
 
     // Build messages array with conversation history
@@ -1370,6 +1345,60 @@ Be conversational, accurate with names/recipients, and wait for confirmation.`;
   } catch (err) {
     console.error('❌ Chat error:', err);
     res.status(500).json({ error: 'Failed to process chat message' });
+  }
+});
+
+// ============================================================================
+// CONTACT LOOKUP ENDPOINTS - On-Demand Only
+// ============================================================================
+
+/**
+ * GET /api/contacts/search?q=name
+ * Search user's device contacts - returns MAX 2 results only
+ * Frontend should send device contacts in request body for server-side matching
+ */
+app.post('/api/contacts/search', authenticateUser, async (req, res) => {
+  try {
+    const { query, contacts } = req.body;
+    const userId = req.user.id;
+
+    if (!query || !contacts || !Array.isArray(contacts)) {
+      return res.status(400).json({ error: 'Query and contacts array required' });
+    }
+
+    console.log(`[CONTACT_SEARCH] user=${userId} q="${query}" total_contacts=${contacts.length}`);
+
+    // Simple fuzzy matching (case-insensitive, substring match)
+    const queryLower = query.toLowerCase().trim();
+    const matches = contacts
+      .filter(c => {
+        const nameLower = (c.name || '').toLowerCase();
+        const emailLower = (c.email || '').toLowerCase();
+        const companyLower = (c.company || '').toLowerCase();
+        return nameLower.includes(queryLower) || 
+               emailLower.includes(queryLower) ||
+               companyLower.includes(queryLower);
+      })
+      .slice(0, 2) // Hard limit: MAX 2 results
+      .map((c, idx) => ({
+        contact_id: `${userId}-${idx}`, // Ephemeral ID for this session
+        display_name: c.name,
+        primary_email: c.email || null,
+        primary_phone: c.phone || null,
+        company: c.company || null
+      }));
+
+    console.log(`[CONTACT_SEARCH] results=${matches.length}`);
+
+    res.json({
+      success: true,
+      results: matches,
+      query: query
+    });
+
+  } catch (err) {
+    console.error('❌ Contact search error:', err);
+    res.status(500).json({ error: 'Failed to search contacts' });
   }
 });
 
