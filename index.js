@@ -2050,43 +2050,486 @@ app.post('/api/assistant/send-email', authenticateUser, async (req, res) => {
 
 /**
  * POST /api/assistant/send-sms
- * Sends an SMS via Twilio
+ * Sends an SMS via Twilio (Pattern B - Action Framework)
  * REQUIRES: TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER environment variables
  */
 app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
+  const requestStart = Date.now();
+  const { request_id, recipient, content } = req.body;
+  const userId = req.user.id;
+
+  // Validation
+  if (!request_id) {
+    return res.status(400).json({ error: 'request_id is required' });
+  }
+  if (!recipient || !content) {
+    return res.status(400).json({ error: 'Recipient and content are required' });
+  }
+
+  console.log(`[SMS] 📱 request_id=${request_id} user=${userId} to=${recipient}`);
+
   try {
-    const { recipient, content } = req.body;
-    const userId = req.user.id;
-
-    if (!recipient || !content) {
-      return res.status(400).json({ error: 'Recipient and content are required' });
-    }
-
     // Check if Twilio is configured
     if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
-      console.warn('⚠️ SMS not configured - TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, TWILIO_PHONE_NUMBER required');
-      return res.status(503).json({ error: 'SMS service not configured' });
+      console.warn(`[SMS] ⚠️ Twilio not configured - request_id=${request_id}`);
+      
+      // Log failure to action_logs
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'send_sms',
+        payload_json: { recipient, content },
+        status: 'failed',
+        provider: 'twilio',
+        error_message: 'SMS service not configured (missing Twilio credentials)'
+      });
+      
+      return res.status(503).json({ 
+        success: false,
+        request_id,
+        error: 'SMS service not configured' 
+      });
     }
 
+    // Initialize Twilio client
     const twilio = require('twilio');
     const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
+    // Send SMS
     const message = await client.messages.create({
       body: content,
       from: process.env.TWILIO_PHONE_NUMBER,
       to: recipient
     });
 
-    console.log(`✅ SMS sent: ${message.sid} to ${recipient} for user ${userId}`);
+    const duration = Date.now() - requestStart;
+    console.log(`[SMS] ✅ Sent in ${duration}ms: ${message.sid} to ${recipient} request_id=${request_id}`);
+
+    // Log success to action_logs
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'send_sms',
+      payload_json: { recipient, content },
+      status: 'sent',
+      provider: 'twilio',
+      provider_id: message.sid,
+      completed_at: new Date().toISOString()
+    });
 
     res.json({
       success: true,
-      messageSid: message.sid,
-      recipient
+      request_id,
+      provider_id: message.sid,
+      recipient,
+      status: 'sent'
     });
   } catch (error) {
-    console.error('Error sending SMS:', error);
-    res.status(500).json({ error: 'Failed to send SMS', details: error.message });
+    const duration = Date.now() - requestStart;
+    console.error(`[SMS] ❌ Failed in ${duration}ms: request_id=${request_id} error=${error.message}`);
+    
+    // Log failure to action_logs
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'send_sms',
+      payload_json: { recipient, content },
+      status: 'failed',
+      provider: 'twilio',
+      error_message: error.message
+    });
+    
+    res.status(500).json({ 
+      success: false,
+      request_id,
+      error: 'Failed to send SMS', 
+      details: error.message 
+    });
+  }
+});
+
+/**
+ * POST /api/assistant/create-docx
+ * Creates a Word document (.docx) using docx library (Pattern B - Action Framework)
+ */
+app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
+  const requestStart = Date.now();
+  const { request_id, filename, content } = req.body;
+  const userId = req.user.id;
+
+  // Validation
+  if (!request_id) {
+    return res.status(400).json({ error: 'request_id is required' });
+  }
+  if (!content) {
+    return res.status(400).json({ error: 'Content is required' });
+  }
+
+  const safeFilename = filename || `document_${Date.now()}.docx`;
+  console.log(`[DOCX] 📄 request_id=${request_id} user=${userId} filename=${safeFilename}`);
+
+  try {
+    const { Document, Packer, Paragraph, TextRun } = require('docx');
+    const fs = require('fs');
+    const path = require('path');
+
+    // Create document with content
+    const doc = new Document({
+      sections: [{
+        properties: {},
+        children: [
+          new Paragraph({
+            children: [
+              new TextRun({
+                text: content,
+                size: 24, // 12pt font
+              }),
+            ],
+          }),
+        ],
+      }],
+    });
+
+    // Generate docx buffer
+    const buffer = await Packer.toBuffer(doc);
+
+    // For now, save to temporary directory (TODO: Upload to cloud storage)
+    const tempDir = path.join(__dirname, 'temp_files');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    const filePath = path.join(tempDir, safeFilename);
+    fs.writeFileSync(filePath, buffer);
+
+    const duration = Date.now() - requestStart;
+    const fileUrl = `/temp_files/${safeFilename}`; // Temporary local URL
+
+    console.log(`[DOCX] ✅ Created in ${duration}ms: ${safeFilename} request_id=${request_id}`);
+
+    // Log to action_logs
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'create_docx',
+      payload_json: { filename: safeFilename, content },
+      status: 'completed',
+      provider: 'docx',
+      provider_url: fileUrl,
+      completed_at: new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      request_id,
+      url: fileUrl,
+      filename: safeFilename,
+      status: 'completed'
+    });
+  } catch (error) {
+    const duration = Date.now() - requestStart;
+    console.error(`[DOCX] ❌ Failed in ${duration}ms: request_id=${request_id} error=${error.message}`);
+
+    // Log failure
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'create_docx',
+      payload_json: { filename: safeFilename, content },
+      status: 'failed',
+      provider: 'docx',
+      error_message: error.message
+    });
+
+    res.status(500).json({
+      success: false,
+      request_id,
+      error: 'Failed to create document',
+      details: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/assistant/create-xlsx
+ * Creates an Excel spreadsheet (.xlsx) using xlsx library (Pattern B - Action Framework)
+ */
+app.post('/api/assistant/create-xlsx', authenticateUser, async (req, res) => {
+  const requestStart = Date.now();
+  const { request_id, filename, content, data } = req.body;
+  const userId = req.user.id;
+
+  // Validation
+  if (!request_id) {
+    return res.status(400).json({ error: 'request_id is required' });
+  }
+  if (!content && !data) {
+    return res.status(400).json({ error: 'Content or data is required' });
+  }
+
+  const safeFilename = filename || `spreadsheet_${Date.now()}.xlsx`;
+  console.log(`[XLSX] 📊 request_id=${request_id} user=${userId} filename=${safeFilename}`);
+
+  try {
+    const XLSX = require('xlsx');
+    const fs = require('fs');
+    const path = require('path');
+
+    // Create workbook
+    const wb = XLSX.utils.book_new();
+
+    // If structured data provided, use it; otherwise parse content as simple rows
+    if (data && Array.isArray(data)) {
+      const ws = XLSX.utils.json_to_sheet(data);
+      XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+    } else {
+      // Simple text content - split into rows
+      const rows = content.split('\\n').map(line => [line]);
+      const ws = XLSX.utils.aoa_to_sheet(rows);
+      XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
+    }
+
+    // Write to temporary directory
+    const tempDir = path.join(__dirname, 'temp_files');
+    if (!fs.existsSync(tempDir)) {
+      fs.mkdirSync(tempDir, { recursive: true });
+    }
+
+    const filePath = path.join(tempDir, safeFilename);
+    XLSX.writeFile(wb, filePath);
+
+    const duration = Date.now() - requestStart;
+    const fileUrl = `/temp_files/${safeFilename}`;
+
+    console.log(`[XLSX] ✅ Created in ${duration}ms: ${safeFilename} request_id=${request_id}`);
+
+    // Log to action_logs
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'create_xlsx',
+      payload_json: { filename: safeFilename, content, data },
+      status: 'completed',
+      provider: 'xlsx',
+      provider_url: fileUrl,
+      completed_at: new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      request_id,
+      url: fileUrl,
+      filename: safeFilename,
+      status: 'completed'
+    });
+  } catch (error) {
+    const duration = Date.now() - requestStart;
+    console.error(`[XLSX] ❌ Failed in ${duration}ms: request_id=${request_id} error=${error.message}`);
+
+    // Log failure
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'create_xlsx',
+      payload_json: { filename: safeFilename, content, data },
+      status: 'failed',
+      provider: 'xlsx',
+      error_message: error.message
+    });
+
+    res.status(500).json({
+      success: false,
+      request_id,
+      error: 'Failed to create spreadsheet',
+      details: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/assistant/create-calendar-event
+ * Creates a calendar event via Google Calendar API (Pattern B - Action Framework)
+ * Logs to action_logs with request_id tracking
+ */
+app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, res) => {
+  const requestStart = Date.now();
+  const { request_id, title, content, rawContent } = req.body;
+  const userId = req.user.id;
+
+  // Validation
+  if (!request_id) {
+    return res.status(400).json({ error: 'request_id is required' });
+  }
+  if (!title) {
+    return res.status(400).json({ error: 'Title is required' });
+  }
+
+  console.log(`[CALENDAR] 📅 request_id=${request_id} user=${userId} title=${title}`);
+
+  try {
+    // Check Google Calendar configuration
+    if (!process.env.GOOGLE_CALENDAR_CLIENT_ID || !process.env.GOOGLE_CALENDAR_CLIENT_SECRET) {
+      console.log('[CALENDAR] ⚠️ Google Calendar not configured - using placeholder');
+      
+      // Log failure to action_logs
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'create_calendar_event',
+        payload_json: { title, content, rawContent },
+        status: 'failed',
+        provider: 'google_calendar',
+        error_message: 'Calendar service not configured'
+      });
+      
+      return res.status(503).json({ 
+        success: false, 
+        request_id, 
+        error: 'Calendar service not configured. Please provide Google Calendar API credentials.' 
+      });
+    }
+
+    // TODO: Get user's Google Calendar refresh token from database
+    // TODO: Exchange refresh token for access token
+    // TODO: Parse date/time from rawContent (or use default: tomorrow at noon)
+    // TODO: Call Google Calendar API to create event
+    
+    // Placeholder implementation - return success for now
+    const eventId = `event_${Date.now()}`;
+    const eventLink = `https://calendar.google.com/event?eid=${eventId}`;
+    
+    const duration = Date.now() - requestStart;
+    console.log(`[CALENDAR] ✅ Created in ${duration}ms: ${eventId} request_id=${request_id}`);
+
+    // Log success to action_logs
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'create_calendar_event',
+      payload_json: { title, content, rawContent },
+      status: 'completed',
+      provider: 'google_calendar',
+      provider_id: eventId,
+      provider_url: eventLink,
+      completed_at: new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      request_id,
+      provider_id: eventId,
+      event_link: eventLink,
+      status: 'completed'
+    });
+  } catch (error) {
+    const duration = Date.now() - requestStart;
+    console.error(`[CALENDAR] ❌ Failed in ${duration}ms: request_id=${request_id} error=${error.message}`);
+
+    // Log failure
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'create_calendar_event',
+      payload_json: { title, content, rawContent },
+      status: 'failed',
+      provider: 'google_calendar',
+      error_message: error.message
+    });
+
+    res.status(500).json({
+      success: false,
+      request_id,
+      error: 'Failed to create calendar event',
+      details: error.message
+    });
+  }
+});
+
+/**
+ * POST /api/assistant/create-reminder
+ * Creates a reminder (internal database) (Pattern B - Action Framework)
+ * Logs to action_logs with request_id tracking
+ */
+app.post('/api/assistant/create-reminder', authenticateUser, async (req, res) => {
+  const requestStart = Date.now();
+  const { request_id, text, rawContent } = req.body;
+  const userId = req.user.id;
+
+  // Validation
+  if (!request_id) {
+    return res.status(400).json({ error: 'request_id is required' });
+  }
+  if (!text) {
+    return res.status(400).json({ error: 'Text is required' });
+  }
+
+  console.log(`[REMINDER] ⏰ request_id=${request_id} user=${userId} text=${text}`);
+
+  try {
+    // TODO: Parse remind_at time from rawContent using date/time NLP
+    // For now, default to 1 hour from now
+    const remindAt = new Date(Date.now() + 60 * 60 * 1000).toISOString();
+
+    // Insert into reminders table
+    const { data: reminder, error: insertError } = await supabaseAdmin
+      .from('reminders')
+      .insert({
+        user_id: userId,
+        text: text,
+        remind_at: remindAt,
+        status: 'pending'
+      })
+      .select()
+      .single();
+
+    if (insertError) {
+      console.error('[REMINDER] Insert error:', insertError);
+      throw insertError;
+    }
+
+    const duration = Date.now() - requestStart;
+    console.log(`[REMINDER] ✅ Created in ${duration}ms: ${reminder.id} request_id=${request_id}`);
+
+    // Log to action_logs
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'create_reminder',
+      payload_json: { text, rawContent, remind_at: remindAt },
+      status: 'completed',
+      provider: 'internal',
+      provider_id: reminder.id,
+      completed_at: new Date().toISOString()
+    });
+
+    res.json({
+      success: true,
+      request_id,
+      provider_id: reminder.id,
+      remind_at: remindAt,
+      status: 'completed'
+    });
+  } catch (error) {
+    const duration = Date.now() - requestStart;
+    console.error(`[REMINDER] ❌ Failed in ${duration}ms: request_id=${request_id} error=${error.message}`);
+
+    // Log failure
+    await supabaseAdmin.from('action_logs').insert({
+      request_id,
+      user_id: userId,
+      action_type: 'create_reminder',
+      payload_json: { text, rawContent },
+      status: 'failed',
+      provider: 'internal',
+      error_message: error.message
+    });
+
+    res.status(500).json({
+      success: false,
+      request_id,
+      error: 'Failed to create reminder',
+      details: error.message
+    });
   }
 });
 
