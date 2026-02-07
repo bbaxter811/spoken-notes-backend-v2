@@ -473,21 +473,6 @@ const upload = multer({
 // CORS middleware
 app.use(cors());
 
-// Static file serving for temp files
-const tempDir = path.join(__dirname, 'temp_files');
-app.use('/temp_files', express.static(tempDir, {
-  maxAge: '7d',
-  setHeaders: (res, filePath) => {
-    if (filePath.endsWith('.docx')) {
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
-      res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
-    } else if (filePath.endsWith('.xlsx')) {
-      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
-    }
-  }
-}));
-
 // Auth middleware
 const authenticateUser = async (req, res, next) => {
   try {
@@ -2250,6 +2235,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
 /**
  * POST /api/assistant/create-docx
  * Creates a Word document (.docx) using docx library (Pattern B - Action Framework)
+ * Uploads to Supabase Storage with quota enforcement
  */
 app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
   const requestStart = Date.now();
@@ -2269,8 +2255,6 @@ app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
 
   try {
     const { Document, Packer, Paragraph, TextRun } = require('docx');
-    const fs = require('fs');
-    const path = require('path');
 
     // Create document with content
     const doc = new Document({
@@ -2289,40 +2273,146 @@ app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
       }],
     });
 
-    // Generate docx buffer
+    // Generate docx buffer (in-memory, no disk write)
     const buffer = await Packer.toBuffer(doc);
+    const fileSize = buffer.length;
 
-    // For now, save to temporary directory (TODO: Upload to cloud storage)
-    const tempDir = path.join(__dirname, 'temp_files');
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
+    console.log(`[DOCX] 📦 Generated buffer: ${fileSize} bytes`);
+
+    // Check storage quota BEFORE upload
+    const { data: user, error: userError } = await supabaseAdmin
+      .from('users')
+      .select('storage_used_bytes, storage_limit_bytes')
+      .eq('id', userId)
+      .single();
+
+    if (userError) {
+      console.error(`[DOCX] ❌ Failed to fetch user quota: ${userError.message}`);
+      return res.status(500).json({ 
+        success: false, 
+        request_id, 
+        error: 'Failed to check storage quota' 
+      });
     }
 
-    const filePath = path.join(tempDir, safeFilename);
-    fs.writeFileSync(filePath, buffer);
+    const storageUsed = user.storage_used_bytes || 0;
+    const storageLimit = user.storage_limit_bytes || 107374182400; // Default 100MB
+
+    if (storageUsed + fileSize > storageLimit) {
+      console.log(`[DOCX] ⚠️ Quota exceeded: ${storageUsed}/${storageLimit} bytes, need ${fileSize} more`);
+      
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'create_docx',
+        payload_json: { filename: safeFilename, content, file_size: fileSize },
+        status: 'failed',
+        provider: 'supabase',
+        error_message: 'Storage quota exceeded'
+      });
+
+      return res.status(402).json({
+        success: false,
+        request_id,
+        error: 'Storage quota exceeded',
+        message: "You're out of storage — upgrade to continue",
+        current_usage: storageUsed,
+        limit: storageLimit,
+        required: fileSize
+      });
+    }
+
+    // Upload to Supabase Storage
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const storagePath = `user/${userId}/${year}/${month}/docx/${request_id}.docx`;
+
+    console.log(`[DOCX] ⬆️ Uploading to Supabase Storage: ${storagePath}`);
+
+    const { data: uploadData, error: uploadError } = await supabaseAdmin.storage
+      .from('spoken-notes-user-files')
+      .upload(storagePath, buffer, {
+        contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+        cacheControl: '604800', // 7 days
+        upsert: false
+      });
+
+    if (uploadError) {
+      console.error(`[DOCX] ❌ Upload failed: ${uploadError.message}`);
+      
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'create_docx',
+        payload_json: { filename: safeFilename, content, file_size: fileSize },
+        status: 'failed',
+        provider: 'supabase',
+        error_message: uploadError.message
+      });
+
+      return res.status(500).json({
+        success: false,
+        request_id,
+        error: 'Failed to upload document to storage',
+        details: uploadError.message
+      });
+    }
+
+    console.log(`[DOCX] ✅ Uploaded successfully: ${uploadData.path}`);
+
+    // Get signed URL (7 days expiry)
+    const { data: signedUrlData, error: signedUrlError } = await supabaseAdmin.storage
+      .from('spoken-notes-user-files')
+      .createSignedUrl(storagePath, 604800); // 7 days
+
+    if (signedUrlError) {
+      console.error(`[DOCX] ⚠️ Failed to generate signed URL: ${signedUrlError.message}`);
+      // Don't fail the request, return file_id as fallback
+    }
+
+    const signedUrl = signedUrlData?.signedUrl || null;
+
+    // Increment storage usage
+    const { error: quotaError } = await supabaseAdmin.rpc('increment_storage_usage', {
+      user_id_param: userId,
+      bytes: fileSize
+    });
+
+    if (quotaError) {
+      console.error(`[DOCX] ⚠️ Failed to increment quota: ${quotaError.message}`);
+      // Don't fail the request, file is already uploaded
+    }
 
     const duration = Date.now() - requestStart;
-    const fileUrl = `/temp_files/${safeFilename}`; // Temporary local URL
-
-    console.log(`[DOCX] ✅ Created in ${duration}ms: ${safeFilename} request_id=${request_id}`);
+    console.log(`[DOCX] ✅ Complete in ${duration}ms: request_id=${request_id} size=${fileSize} bytes`);
 
     // Log to action_logs
     await supabaseAdmin.from('action_logs').insert({
       request_id,
       user_id: userId,
       action_type: 'create_docx',
-      payload_json: { filename: safeFilename, content },
+      payload_json: { 
+        filename: safeFilename, 
+        content, 
+        file_size: fileSize,
+        storage_path: storagePath,
+        storage_provider: 'supabase'
+      },
       status: 'completed',
-      provider: 'docx',
-      provider_url: fileUrl,
+      provider: 'supabase',
+      provider_url: signedUrl,
       completed_at: new Date().toISOString()
     });
 
     res.json({
       success: true,
       request_id,
-      url: fileUrl,
+      url: signedUrl,
+      file_id: storagePath,
       filename: safeFilename,
+      file_size: fileSize,
+      storage_provider: 'supabase',
       status: 'completed'
     });
   } catch (error) {
@@ -2336,7 +2426,7 @@ app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
       action_type: 'create_docx',
       payload_json: { filename: safeFilename, content },
       status: 'failed',
-      provider: 'docx',
+      provider: 'supabase',
       error_message: error.message
     });
 
@@ -2352,6 +2442,7 @@ app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
 /**
  * POST /api/assistant/create-xlsx
  * Creates an Excel spreadsheet (.xlsx) using xlsx library (Pattern B - Action Framework)
+ * Uploads to Supabase Storage with quota enforcement
  */
 app.post('/api/assistant/create-xlsx', authenticateUser, async (req, res) => {
   const requestStart = Date.now();
@@ -2371,8 +2462,6 @@ app.post('/api/assistant/create-xlsx', authenticateUser, async (req, res) => {
 
   try {
     const XLSX = require('xlsx');
-    const fs = require('fs');
-    const path = require('path');
 
     // Create workbook
     const wb = XLSX.utils.book_new();
@@ -2388,37 +2477,147 @@ app.post('/api/assistant/create-xlsx', authenticateUser, async (req, res) => {
       XLSX.utils.book_append_sheet(wb, ws, 'Sheet1');
     }
 
-    // Write to temporary directory
-    const tempDir = path.join(__dirname, 'temp_files');
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
+    // Write to buffer (in-memory, no disk write)
+    const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
+    const fileSize = buffer.length;
+
+    console.log(`[XLSX] 📦 Generated buffer: ${fileSize} bytes`);
+
+    // Check storage quota BEFORE upload
+    const { data: user, error: userError } = await supabaseAdmin
+      .from('users')
+      .select('storage_used_bytes, storage_limit_bytes')
+      .eq('id', userId)
+      .single();
+
+    if (userError) {
+      console.error(`[XLSX] ❌ Failed to fetch user quota: ${userError.message}`);
+      return res.status(500).json({ 
+        success: false, 
+        request_id, 
+        error: 'Failed to check storage quota' 
+      });
     }
 
-    const filePath = path.join(tempDir, safeFilename);
-    XLSX.writeFile(wb, filePath);
+    const storageUsed = user.storage_used_bytes || 0;
+    const storageLimit = user.storage_limit_bytes || 107374182400; // Default 100MB
+
+    if (storageUsed + fileSize > storageLimit) {
+      console.log(`[XLSX] ⚠️ Quota exceeded: ${storageUsed}/${storageLimit} bytes, need ${fileSize} more`);
+      
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'create_xlsx',
+        payload_json: { filename: safeFilename, content, data, file_size: fileSize },
+        status: 'failed',
+        provider: 'supabase',
+        error_message: 'Storage quota exceeded'
+      });
+
+      return res.status(402).json({
+        success: false,
+        request_id,
+        error: 'Storage quota exceeded',
+        message: "You're out of storage — upgrade to continue",
+        current_usage: storageUsed,
+        limit: storageLimit,
+        required: fileSize
+      });
+    }
+
+    // Upload to Supabase Storage
+    const now = new Date();
+    const year = now.getFullYear();
+    const month = String(now.getMonth() + 1).padStart(2, '0');
+    const storagePath = `user/${userId}/${year}/${month}/xlsx/${request_id}.xlsx`;
+
+    console.log(`[XLSX] ⬆️ Uploading to Supabase Storage: ${storagePath}`);
+
+    const { data: uploadData, error: uploadError } = await supabaseAdmin.storage
+      .from('spoken-notes-user-files')
+      .upload(storagePath, buffer, {
+        contentType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        cacheControl: '604800', // 7 days
+        upsert: false
+      });
+
+    if (uploadError) {
+      console.error(`[XLSX] ❌ Upload failed: ${uploadError.message}`);
+      
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'create_xlsx',
+        payload_json: { filename: safeFilename, content, data, file_size: fileSize },
+        status: 'failed',
+        provider: 'supabase',
+        error_message: uploadError.message
+      });
+
+      return res.status(500).json({
+        success: false,
+        request_id,
+        error: 'Failed to upload spreadsheet to storage',
+        details: uploadError.message
+      });
+    }
+
+    console.log(`[XLSX] ✅ Uploaded successfully: ${uploadData.path}`);
+
+    // Get signed URL (7 days expiry)
+    const { data: signedUrlData, error: signedUrlError } = await supabaseAdmin.storage
+      .from('spoken-notes-user-files')
+      .createSignedUrl(storagePath, 604800); // 7 days
+
+    if (signedUrlError) {
+      console.error(`[XLSX] ⚠️ Failed to generate signed URL: ${signedUrlError.message}`);
+      // Don't fail the request, return file_id as fallback
+    }
+
+    const signedUrl = signedUrlData?.signedUrl || null;
+
+    // Increment storage usage
+    const { error: quotaError } = await supabaseAdmin.rpc('increment_storage_usage', {
+      user_id_param: userId,
+      bytes: fileSize
+    });
+
+    if (quotaError) {
+      console.error(`[XLSX] ⚠️ Failed to increment quota: ${quotaError.message}`);
+      // Don't fail the request, file is already uploaded
+    }
 
     const duration = Date.now() - requestStart;
-    const fileUrl = `/temp_files/${safeFilename}`;
-
-    console.log(`[XLSX] ✅ Created in ${duration}ms: ${safeFilename} request_id=${request_id}`);
+    console.log(`[XLSX] ✅ Complete in ${duration}ms: request_id=${request_id} size=${fileSize} bytes`);
 
     // Log to action_logs
     await supabaseAdmin.from('action_logs').insert({
       request_id,
       user_id: userId,
       action_type: 'create_xlsx',
-      payload_json: { filename: safeFilename, content, data },
+      payload_json: { 
+        filename: safeFilename, 
+        content, 
+        data,
+        file_size: fileSize,
+        storage_path: storagePath,
+        storage_provider: 'supabase'
+      },
       status: 'completed',
-      provider: 'xlsx',
-      provider_url: fileUrl,
+      provider: 'supabase',
+      provider_url: signedUrl,
       completed_at: new Date().toISOString()
     });
 
     res.json({
       success: true,
       request_id,
-      url: fileUrl,
+      url: signedUrl,
+      file_id: storagePath,
       filename: safeFilename,
+      file_size: fileSize,
+      storage_provider: 'supabase',
       status: 'completed'
     });
   } catch (error) {
@@ -2432,7 +2631,7 @@ app.post('/api/assistant/create-xlsx', authenticateUser, async (req, res) => {
       action_type: 'create_xlsx',
       payload_json: { filename: safeFilename, content, data },
       status: 'failed',
-      provider: 'xlsx',
+      provider: 'supabase',
       error_message: error.message
     });
 
