@@ -21,10 +21,12 @@ process.on("exit", (code) => {
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
+const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
 const OpenAI = require('openai');
 const { v4: uuidv4 } = require('uuid');
 const sgMail = require('@sendgrid/mail');
+const { google } = require('googleapis');
 
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
@@ -470,6 +472,21 @@ const upload = multer({
 
 // CORS middleware
 app.use(cors());
+
+// Static file serving for temp files
+const tempDir = path.join(__dirname, 'temp_files');
+app.use('/temp_files', express.static(tempDir, {
+  maxAge: '7d',
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.docx')) {
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.wordprocessingml.document');
+      res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
+    } else if (filePath.endsWith('.xlsx')) {
+      res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.setHeader('Content-Disposition', `attachment; filename="${path.basename(filePath)}"`);
+    }
+  }
+}));
 
 // Auth middleware
 const authenticateUser = async (req, res, next) => {
@@ -1646,6 +1663,88 @@ app.post('/api/auth/reset-password', async (req, res) => {
 });
 
 /**
+ * Google OAuth - Initiate Calendar authorization flow
+ */
+app.get('/auth/google/initiate', authenticateUser, (req, res) => {
+  try {
+    console.log('🔐 [OAUTH] Initiating Google Calendar OAuth for user:', req.user.id);
+
+    if (!process.env.GOOGLE_CALENDAR_CLIENT_ID || !process.env.GOOGLE_CALENDAR_CLIENT_SECRET) {
+      return res.status(503).json({ error: 'Calendar OAuth not configured' });
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CALENDAR_CLIENT_ID,
+      process.env.GOOGLE_CALENDAR_CLIENT_SECRET,
+      `${process.env.API_BASE_URL || 'https://spoken-notes-backend-v2.onrender.com'}/auth/google/callback`
+    );
+
+    const authUrl = oauth2Client.generateAuthUrl({
+      access_type: 'offline', // Get refresh token
+      prompt: 'consent', // Force consent screen to get refresh token
+      scope: ['https://www.googleapis.com/auth/calendar.events'],
+      state: req.user.id // Pass user ID for callback identification
+    });
+
+    console.log('✅ [OAUTH] Generated auth URL for user:', req.user.id);
+    res.json({ authUrl });
+  } catch (err) {
+    console.error('❌ [OAUTH] Initiation error:', err);
+    res.status(500).json({ error: 'Failed to initiate OAuth flow' });
+  }
+});
+
+/**
+ * Google OAuth - Callback handler (receives authorization code)
+ */
+app.get('/auth/google/callback', async (req, res) => {
+  try {
+    const { code, state: userId } = req.query;
+    console.log('🔐 [OAUTH] Callback received for user:', userId);
+
+    if (!code || !userId) {
+      console.log('❌ [OAUTH] Missing code or userId');
+      return res.redirect('spokennotesclean://oauth-error?error=missing_params');
+    }
+
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CALENDAR_CLIENT_ID,
+      process.env.GOOGLE_CALENDAR_CLIENT_SECRET,
+      `${process.env.API_BASE_URL || 'https://spoken-notes-backend-v2.onrender.com'}/auth/google/callback`
+    );
+
+    // Exchange authorization code for tokens
+    const { tokens } = await oauth2Client.getToken(code);
+    console.log('✅ [OAUTH] Received tokens (refresh_token present:', !!tokens.refresh_token, ')');
+
+    if (!tokens.refresh_token) {
+      console.log('⚠️ [OAUTH] No refresh token received - user may have already authorized');
+      return res.redirect('spokennotesclean://oauth-error?error=no_refresh_token');
+    }
+
+    // Store refresh token in database
+    const { error: dbError } = await supabaseAdmin
+      .from('users')
+      .update({
+        google_refresh_token: tokens.refresh_token,
+        google_token_expires_at: tokens.expiry_date ? new Date(tokens.expiry_date).toISOString() : null
+      })
+      .eq('id', userId);
+
+    if (dbError) {
+      console.error('❌ [OAUTH] Failed to store tokens:', dbError);
+      return res.redirect('spokennotesclean://oauth-error?error=database_error');
+    }
+
+    console.log('✅ [OAUTH] Tokens stored successfully for user:', userId);
+    res.redirect('spokennotesclean://oauth-success');
+  } catch (err) {
+    console.error('❌ [OAUTH] Callback error:', err);
+    res.redirect('spokennotesclean://oauth-error?error=token_exchange_failed');
+  }
+});
+
+/**
  * TTS - Generate speech from text (Premium feature)
  */
 app.post('/api/tts', authenticateUser, async (req, res) => {
@@ -2369,9 +2468,8 @@ app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, r
   try {
     // Check Google Calendar configuration
     if (!process.env.GOOGLE_CALENDAR_CLIENT_ID || !process.env.GOOGLE_CALENDAR_CLIENT_SECRET) {
-      console.log('[CALENDAR] ⚠️ Google Calendar not configured - using placeholder');
+      console.log('[CALENDAR] ⚠️ Google Calendar not configured');
       
-      // Log failure to action_logs
       await supabaseAdmin.from('action_logs').insert({
         request_id,
         user_id: userId,
@@ -2389,14 +2487,97 @@ app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, r
       });
     }
 
-    // TODO: Get user's Google Calendar refresh token from database
-    // TODO: Exchange refresh token for access token
-    // TODO: Parse date/time from rawContent (or use default: tomorrow at noon)
-    // TODO: Call Google Calendar API to create event
+    // Get user's Google Calendar refresh token from database
+    const { data: user, error: userError } = await supabaseAdmin
+      .from('users')
+      .select('google_refresh_token')
+      .eq('id', userId)
+      .single();
+
+    if (userError || !user) {
+      console.log('[CALENDAR] ❌ Failed to fetch user:', userError?.message);
+      
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'create_calendar_event',
+        payload_json: { title, content, rawContent },
+        status: 'failed',
+        provider: 'google_calendar',
+        error_message: 'User not found'
+      });
+      
+      return res.status(500).json({ 
+        success: false, 
+        request_id, 
+        error: 'Failed to fetch user data' 
+      });
+    }
+
+    if (!user.google_refresh_token) {
+      console.log('[CALENDAR] ⚠️ User has not connected Google Calendar');
+      
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'create_calendar_event',
+        payload_json: { title, content, rawContent },
+        status: 'requires_auth',
+        provider: 'google_calendar',
+        error_message: 'Google Calendar not connected'
+      });
+      
+      return res.status(401).json({ 
+        success: false, 
+        request_id, 
+        error: 'Google Calendar not connected',
+        auth_url: '/auth/google/initiate' 
+      });
+    }
+
+    // Initialize OAuth2 client with refresh token
+    const oauth2Client = new google.auth.OAuth2(
+      process.env.GOOGLE_CALENDAR_CLIENT_ID,
+      process.env.GOOGLE_CALENDAR_CLIENT_SECRET,
+      `${process.env.API_BASE_URL || 'https://spoken-notes-backend-v2.onrender.com'}/auth/google/callback`
+    );
+
+    oauth2Client.setCredentials({
+      refresh_token: user.google_refresh_token
+    });
+
+    // Parse date/time from rawContent (simple heuristic for now)
+    // Default: tomorrow at 2:00 PM for 1 hour
+    const tomorrow = new Date();
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    tomorrow.setHours(14, 0, 0, 0);
     
-    // Placeholder implementation - return success for now
-    const eventId = `event_${Date.now()}`;
-    const eventLink = `https://calendar.google.com/event?eid=${eventId}`;
+    const eventEnd = new Date(tomorrow);
+    eventEnd.setHours(15, 0, 0, 0);
+
+    // Create calendar event
+    const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
+    
+    const event = {
+      summary: title,
+      description: content || rawContent || '',
+      start: {
+        dateTime: tomorrow.toISOString(),
+        timeZone: 'America/New_York' // TODO: Get user timezone
+      },
+      end: {
+        dateTime: eventEnd.toISOString(),
+        timeZone: 'America/New_York'
+      }
+    };
+
+    const calendarResponse = await calendar.events.insert({
+      calendarId: 'primary',
+      requestBody: event
+    });
+
+    const eventId = calendarResponse.data.id;
+    const eventLink = calendarResponse.data.htmlLink;
     
     const duration = Date.now() - requestStart;
     console.log(`[CALENDAR] ✅ Created in ${duration}ms: ${eventId} request_id=${request_id}`);

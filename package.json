@@ -20,6 +20,7 @@
     "dotenv": "^17.2.3",
     "exceljs": "^4.4.0",
     "express": "^5.2.1",
+    "googleapis": "^171.4.0",
     "multer": "^2.0.2",
     "nodemailer": "^7.0.13",
     "openai": "^6.15.0",
