@@ -1219,7 +1219,8 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
       assistantName = 'Assistant',
       voiceGender = 'female',
       voiceAttitude = 'helpful',
-      conversationHistory = [] // Accept conversation history from client
+      conversationHistory = [], // Accept conversation history from client
+      userName // User's name for personalization
     } = req.body;
     const userId = req.user.id;
 
@@ -1229,12 +1230,14 @@ app.post('/api/chat', authenticateUser, async (req, res) => {
 
     console.log(`💬 Chat request from user ${userId}, mode: ${retrievalMode}`);
     console.log('   Personality -> Name: ' + assistantName + ', Gender: ' + voiceGender + ', Attitude: ' + voiceAttitude);
+    console.log('   User name: ' + (userName || 'not provided'));
     console.log('   Conversation history: ' + conversationHistory.length + ' messages');
 
-    // Build personality description
+    // Build personality description with user's name
     const genderDesc = voiceGender === 'male' ? 'male' : 'female';
     const attitudeDesc = voiceAttitude === 'friendly' ? 'friendly and warm' : voiceAttitude === 'formal' ? 'professional and formal' : 'helpful and supportive';
-    const personality = `You are ${assistantName}, a ${genderDesc} ${attitudeDesc} AI assistant.`;
+    const userGreeting = userName ? ` The user's name is ${userName}. Address them by name when appropriate to make conversations more personal.` : '';
+    const personality = `You are ${assistantName}, a ${genderDesc} ${attitudeDesc} AI assistant.${userGreeting}`;
 
     // Assistant personality and role (Production Architecture)
     const capabilities = `
