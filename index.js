@@ -498,6 +498,103 @@ const authenticateUser = async (req, res, next) => {
   }
 };
 
+// SMS Rate Limiting Helper
+async function checkSmsRateLimit(userId, userPlan) {
+  const now = new Date();
+  
+  // Get or create rate limit record
+  let { data: rateLimitData, error} = await supabaseAdmin
+    .from('sms_rate_limits')
+    .select('*')
+    .eq('user_id', userId)
+    .single();
+
+  if (error || !rateLimitData) {
+    // Create initial rate limit record
+    const { data: newRecord } = await supabaseAdmin
+      .from('sms_rate_limits')
+      .insert({
+        user_id: userId,
+        minute_count: 0,
+        minute_reset_at: now,
+        hour_count: 0,
+        hour_reset_at: now,
+        day_count: 0,
+        day_reset_at: now
+      })
+      .select()
+      .single();
+    rateLimitData = newRecord || { minute_count: 0, hour_count: 0, day_count: 0 };
+  }
+
+  // Define limits per plan
+  const limits = {
+    free: { minute: 0, hour: 0, day: 0 }, // No SMS on free
+    pro: { minute: 5, hour: 30, day: 500 },
+    plus: { minute: 10, hour: 100, day: 9999 } // "unlimited" with fair use
+  };
+
+  const planLimits = limits[userPlan] || limits.free;
+
+  // Reset counters if time windows expired
+  const minuteExpired = new Date(rateLimitData.minute_reset_at) < new Date(now.getTime() - 60000); // 1 min ago
+  const hourExpired = new Date(rateLimitData.hour_reset_at) < new Date(now.getTime() - 3600000); // 1 hour ago
+  const dayExpired = new Date(rateLimitData.day_reset_at) < new Date(now.getTime() - 86400000); // 1 day ago
+
+  if (minuteExpired) {
+    rateLimitData.minute_count = 0;
+    rateLimitData.minute_reset_at = now;
+  }
+  if (hourExpired) {
+    rateLimitData.hour_count = 0;
+    rateLimitData.hour_reset_at = now;
+  }
+  if (dayExpired) {
+    rateLimitData.day_count = 0;
+    rateLimitData.day_reset_at = now;
+  }
+
+  // Check limits
+  if (rateLimitData.minute_count >= planLimits.minute && planLimits.minute > 0) {
+    return { 
+      allowed: false, 
+      reason: `Minute limit exceeded (${planLimits.minute}/min)`,
+      retry_after: Math.ceil((new Date(rateLimitData.minute_reset_at).getTime() + 60000 - now.getTime()) / 1000)
+    };
+  }
+  if (rateLimitData.hour_count >= planLimits.hour && planLimits.hour > 0) {
+    return { 
+      allowed: false, 
+      reason: `Hour limit exceeded (${planLimits.hour}/hour)`,
+      retry_after: Math.ceil((new Date(rateLimitData.hour_reset_at).getTime() + 3600000 - now.getTime()) / 1000)
+    };
+  }
+  if (rateLimitData.day_count >= planLimits.day && planLimits.day > 0) {
+    return { 
+      allowed: false, 
+      reason: `Daily limit exceeded (${planLimits.day}/day)`,
+      retry_after: Math.ceil((new Date(rateLimitData.day_reset_at).getTime() + 86400000 - now.getTime()) / 1000)
+    };
+  }
+
+  // Increment counters
+  await supabaseAdmin
+    .from('sms_rate_limits')
+    .update({
+      minute_count: rateLimitData.minute_count + 1,
+      hour_count: rateLimitData.hour_count + 1,
+      day_count: rateLimitData.day_count + 1,
+      last_sms_at: now,
+      updated_at: now,
+      minute_reset_at: rateLimitData.minute_reset_at,
+      hour_reset_at: rateLimitData.hour_reset_at,
+      day_reset_at: rateLimitData.day_reset_at
+    })
+    .eq('user_id', userId);
+
+  return { allowed: true };
+}
+
 // Health check endpoint
 app.get('/health', (req, res) => {
   res.json({
@@ -1269,6 +1366,17 @@ When user requests to send email or SMS:
 3. Wait for user confirmation
 4. NEVER say action completed until AFTER user confirms
 
+RECOGNIZING USER CONFIRMATION:
+After you ask "Ready to send?", the user will confirm with natural language.
+Treat ANY of these as confirmation to proceed:
+✅ yes, yeah, yep, yup, sure, okay, ok, alright
+✅ send, send it, send that, go ahead, please send
+✅ send it please, go ahead and send
+✅ confirm, confirmed, do it, let's do it
+
+When you see confirmation, immediately respond with action completion (example: "Sent to Brian Baxter!")
+DO NOT ask for confirmation again or continue conversation - just confirm the action completed.
+
 EMAIL Examples:
 ✅ User: "Send email to Brian Baxter saying hello"
    You: "I'll send an email to Brian Baxter saying: hello. Ready to send?"
@@ -1288,6 +1396,18 @@ SMS/TEXT Examples (IMPORTANT - Always use confirmation phrase):
 
 ✅ User: "SMS Brian saying call me back"
    You: "I'll send a text to Brian saying: call me back. Ready to send?"
+
+CRITICAL - "SEND ME" means send to USER (not a contact named "me"):
+✅ User: "Send me a text message saying test"
+   You: "I'll send a text to you saying: test. Ready to send?"
+   
+✅ User: "Send me a text saying Red Bull has wings"
+   You: "I'll send a text to you saying: Red Bull has wings. Ready to send?"
+   
+✅ User: "Text me saying call back"
+   You: "I'll send a text to you saying: call back. Ready to send?"
+
+NEVER interpret "me" as a contact name - "send me" ALWAYS means send to the user themselves.
 
 FORBIDDEN (Never say these):
 ❌ "The email has been sent" (before user confirms)
@@ -1320,7 +1440,7 @@ Be conversational, accurate with names/recipients, and wait for confirmation.`;
         .eq('user_id', userId)
         .eq('status', 'completed')
         .not('transcription', 'is', null)
-        .order('created_at', { ascending: false});
+        .order('created_at', { ascending: false });
       // NO LIMIT - Chat can access ALL transcripts from Supabase
 
       if (recordings && recordings.length > 0) {
@@ -1398,9 +1518,9 @@ app.post('/api/contacts/search', authenticateUser, async (req, res) => {
         const nameLower = (c.name || '').toLowerCase();
         const emailLower = (c.email || '').toLowerCase();
         const companyLower = (c.company || '').toLowerCase();
-        return nameLower.includes(queryLower) || 
-               emailLower.includes(queryLower) ||
-               companyLower.includes(queryLower);
+        return nameLower.includes(queryLower) ||
+          emailLower.includes(queryLower) ||
+          companyLower.includes(queryLower);
       })
       .slice(0, 2) // Hard limit: MAX 2 results
       .map((c, idx) => ({
@@ -1552,11 +1672,19 @@ app.post('/api/user/preferences', authenticateUser, async (req, res) => {
 app.post('/api/auth/signup', async (req, res) => {
   try {
     console.log('📝 Signup request received:', req.body.email);
-    const { email, password, name } = req.body;
+    const { email, password, name, phone } = req.body;
 
     if (!email || !password) {
       console.log('❌ Missing email or password');
       return res.status(400).json({ error: 'Email and password are required' });
+    }
+
+    // Validate phone format if provided (E.164: +1XXXXXXXXXX)
+    if (phone && !/^\+1\d{10}$/.test(phone)) {
+      console.log('❌ Invalid phone format:', phone);
+      return res.status(400).json({ 
+        error: 'Invalid phone number format. Use +1XXXXXXXXXX (e.g., +14438004564)' 
+      });
     }
 
     const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_ROLE_KEY);
@@ -1565,6 +1693,7 @@ app.post('/api/auth/signup', async (req, res) => {
     const { data: authData, error: authError } = await supabase.auth.signUp({
       email,
       password,
+      phone: phone || null,
       options: {
         data: {
           name: name || null
@@ -1577,7 +1706,30 @@ app.post('/api/auth/signup', async (req, res) => {
       return res.status(400).json({ error: authError.message });
     }
 
-    console.log('✅ Signup successful:', authData.user.id);
+    // If phone provided during signup, log consent source (TCPA compliance)
+    if (phone && authData.user) {
+      try {
+        const clientIp = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
+        const userAgent = req.headers['user-agent'] || 'unknown';
+        
+        await supabase
+          .from('user_consent_data')
+          .upsert({
+            user_id: authData.user.id,
+            consent_method: 'web_signup',
+            consent_ip: clientIp,
+            consent_user_agent: userAgent,
+            plan: 'free' // Default plan for new signups
+          });
+        
+        console.log(`✅ Consent logged: method=web_signup ip=${clientIp}`);
+      } catch (consentError) {
+        console.error('⚠️  Failed to log consent metadata:', consentError);
+        // Don't fail signup if consent logging fails
+      }
+    }
+
+    console.log('✅ Signup successful:', authData.user.id, phone ? `with phone: ${phone}` : 'no phone');
     // Return user data and session token
     res.json({
       token: authData.session.access_token,
@@ -1585,6 +1737,7 @@ app.post('/api/auth/signup', async (req, res) => {
         id: authData.user.id,
         email: authData.user.email,
         name: authData.user.user_metadata?.name,
+        phone: authData.user.phone,
         created_at: authData.user.created_at
       }
     });
@@ -2174,10 +2327,165 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
   console.log(`[SMS] 📱 request_id=${request_id} user=${userId} to=${recipient}`);
 
   try {
+    // CRITICAL: Plan-based feature gate (server-side enforcement)
+    const { data: userPlanData, error: planError } = await supabaseAdmin
+      .from('user_consent_data')
+      .select('plan')
+      .eq('user_id', userId)
+      .single();
+
+    const userPlan = userPlanData?.plan || 'free';
+    
+    // Free plan: No SMS access
+    if (userPlan === 'free') {
+      console.log(`[SMS] 🚫 Free plan user attempted SMS: user=${userId}`);
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'send_sms',
+        payload_json: { recipient, content },
+        status: 'failed',
+        provider: 'twilio',
+        error_message: 'SMS feature requires Pro or Plus plan'
+      });
+      return res.status(402).json({
+        success: false,
+        request_id,
+        error: 'SMS feature requires Pro or Plus plan',
+        upgrade_required: true,
+        message: 'Upgrade to Pro ($13/month) or Plus ($29/month) to use SMS features'
+      });
+    }
+
+    // Rate limiting check
+    const rateLimitResult = await checkSmsRateLimit(userId, userPlan);
+    if (!rateLimitResult.allowed) {
+      console.log(`[SMS] 🚫 Rate limit exceeded: user=${userId} ${rateLimitResult.reason}`);
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'send_sms',
+        payload_json: { recipient, content },
+        status: 'failed',
+        provider: 'twilio',
+        error_message: `Rate limit exceeded: ${rateLimitResult.reason}`
+      });
+      return res.status(429).json({
+        success: false,
+        request_id,
+        error: 'Rate limit exceeded',
+        details: rateLimitResult.reason,
+        retry_after: rateLimitResult.retry_after
+      });
+    }
+
+    // Handle "SELF" marker - send to user's own phone (like email does with req.user.email)
+    let actualRecipient = recipient;
+    let userPhoneData = null;
+    
+    if (recipient === 'SELF') {
+      // Get user's phone and opt-in status from database (join with consent data)
+      const { data: userData, error: userError } = await supabaseAdmin
+        .from('users')
+        .select('phone, sms_opted_in, sms_consent_timestamp, user_consent_data(consent_method)')
+        .eq('id', userId)
+        .single();
+      
+      // Flatten consent_method from joined table
+      if (userData && userData.user_consent_data) {
+        userData.consent_method = userData.user_consent_data[0]?.consent_method;
+      }
+
+      if (userError || !userData?.phone) {
+        console.error(`[SMS] ❌ SELF recipient but no phone in database: request_id=${request_id} error=${userError?.message}`);
+        
+        await supabaseAdmin.from('action_logs').insert({
+          request_id,
+          user_id: userId,
+          action_type: 'send_sms',
+          payload_json: { recipient: 'SELF', content },
+          status: 'failed',
+          provider: 'twilio',
+          error_message: 'User phone number not set in profile'
+        });
+
+        return res.status(400).json({
+          success: false,
+          request_id,
+          error: 'Phone number not set',
+          message: 'Please add your phone number in settings to use "send me"'
+        });
+      }
+
+      actualRecipient = userData.phone;
+      userPhoneData = userData;
+      console.log(`[SMS] ✅ SELF resolved: ${recipient} → ${actualRecipient}`);
+    }
+
+    // Check SMS opt-in status (A2P 10DLC compliance)
+    // If user hasn't opted in yet, send confirmation SMS instead
+    if (recipient === 'SELF' && userPhoneData && !userPhoneData.sms_opted_in) {
+      console.log(`[SMS] 🔔 User hasn't opted in to SMS yet - sending opt-in confirmation`);
+      
+      // Check if Twilio is configured
+      if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
+        console.warn(`[SMS] ⚠️ Twilio not configured - request_id=${request_id}`);
+        await supabaseAdmin.from('action_logs').insert({
+          request_id,
+          user_id: userId,
+          action_type: 'send_sms',
+          payload_json: { recipient, content },
+          status: 'failed',
+          provider: 'twilio',
+          error_message: 'SMS service not configured (missing Twilio credentials)'
+        });
+        return res.status(503).json({
+          success: false,
+          request_id,
+          error: 'SMS service not configured'
+        });
+      }
+
+      // Initialize Twilio client
+      const twilio = require('twilio');
+      const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
+
+      // Send opt-in confirmation SMS
+      const confirmationMessage = `SpokenNotes: Reply YES to confirm you want to receive SMS notifications. Reply STOP to opt out. (Note: Campaign approval pending, delivery may be delayed)`;
+      const confirmMsg = await client.messages.create({
+        body: confirmationMessage,
+        from: process.env.TWILIO_PHONE_NUMBER,
+        to: actualRecipient
+      });
+
+      const duration = Date.now() - requestStart;
+      console.log(`[SMS] 📩 Opt-in confirmation sent in ${duration}ms: ${confirmMsg.sid} to ${actualRecipient}`);
+
+      await supabaseAdmin.from('action_logs').insert({
+        request_id,
+        user_id: userId,
+        action_type: 'send_sms_opt_in',
+        payload_json: { recipient, original_content: content },
+        status: 'sent',
+        provider: 'twilio',
+        provider_id: confirmMsg.sid,
+        completed_at: new Date().toISOString()
+      });
+
+      return res.json({
+        success: true,
+        request_id,
+        provider_id: confirmMsg.sid,
+        recipient,
+        status: 'opt_in_required',
+        message: 'SMS opt-in confirmation sent. User must reply YES to enable SMS.'
+      });
+    }
+
     // Check if Twilio is configured
     if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
       console.warn(`[SMS] ⚠️ Twilio not configured - request_id=${request_id}`);
-      
+
       // Log failure to action_logs
       await supabaseAdmin.from('action_logs').insert({
         request_id,
@@ -2188,11 +2496,11 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
         provider: 'twilio',
         error_message: 'SMS service not configured (missing Twilio credentials)'
       });
-      
-      return res.status(503).json({ 
+
+      return res.status(503).json({
         success: false,
         request_id,
-        error: 'SMS service not configured' 
+        error: 'SMS service not configured'
       });
     }
 
@@ -2200,17 +2508,40 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
     const twilio = require('twilio');
     const client = twilio(process.env.TWILIO_ACCOUNT_SID, process.env.TWILIO_AUTH_TOKEN);
 
-    // Send SMS
+    // Log consent source if this is voice command (TCPA compliance)
+    if (recipient === 'SELF' && userPhoneData && !userPhoneData.consent_method) {
+      try {
+        const clientIp = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
+        const userAgent = req.headers['user-agent'] || 'unknown';
+        
+        await supabaseAdmin
+          .from('user_consent_data')
+          .upsert({
+            user_id: userId,
+            consent_method: 'voice_command',
+            consent_ip: clientIp,
+            consent_user_agent: userAgent
+          });
+        
+        console.log(`[SMS] ✅ Consent source logged: method=voice_command ip=${clientIp}`);
+      } catch (consentError) {
+        console.error('[SMS] ⚠️  Failed to log consent source:', consentError);
+      }
+    }
+
+    // Send SMS with status callback for delivery tracking
+    const baseUrl = process.env.BACKEND_URL || `http://localhost:${PORT}`;
     const message = await client.messages.create({
       body: content,
       from: process.env.TWILIO_PHONE_NUMBER,
-      to: recipient
+      to: actualRecipient, // Use resolved recipient (SELF → user's phone)
+      statusCallback: `${baseUrl}/api/webhooks/twilio-status` // Delivery status webhook
     });
 
     const duration = Date.now() - requestStart;
-    console.log(`[SMS] ✅ Sent in ${duration}ms: ${message.sid} to ${recipient} request_id=${request_id}`);
+    console.log(`[SMS] ✅ Sent in ${duration}ms: ${message.sid} to ${actualRecipient} request_id=${request_id}`);
 
-    // Log success to action_logs
+    // Log success to action_logs with delivery status and consent flag
     await supabaseAdmin.from('action_logs').insert({
       request_id,
       user_id: userId,
@@ -2219,6 +2550,8 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
       status: 'sent',
       provider: 'twilio',
       provider_id: message.sid,
+      delivery_status: 'queued', // Initial status, will be updated by webhook
+      consent_confirmed: userPhoneData?.sms_opted_in || false,
       completed_at: new Date().toISOString()
     });
 
@@ -2232,7 +2565,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
   } catch (error) {
     const duration = Date.now() - requestStart;
     console.error(`[SMS] ❌ Failed in ${duration}ms: request_id=${request_id} error=${error.message}`);
-    
+
     // Log failure to action_logs
     await supabaseAdmin.from('action_logs').insert({
       request_id,
@@ -2243,13 +2576,179 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
       provider: 'twilio',
       error_message: error.message
     });
-    
-    res.status(500).json({ 
+
+    res.status(500).json({
       success: false,
       request_id,
-      error: 'Failed to send SMS', 
-      details: error.message 
+      error: 'Failed to send SMS',
+      details: error.message
     });
+  }
+});
+
+/**
+ * POST /api/webhooks/twilio-sms
+ * Twilio webhook for incoming SMS replies (handles SMS opt-in confirmation)
+ * Used for A2P 10DLC compliance - logs user consent when they reply YES
+ * 
+ * Configure in Twilio Console:
+ * Phone Number → Messaging → Webhook → When a message comes in
+ * URL: https://spoken-notes-backend-v2.onrender.com/api/webhooks/twilio-sms
+ */
+app.post('/api/webhooks/twilio-sms', async (req, res) => {
+  try {
+    const { From: fromPhone, Body: messageBody, MessageSid } = req.body;
+    
+    console.log(`[SMS Webhook] 📨 Received from ${fromPhone}: "${messageBody}" (${MessageSid})`);
+
+    // Normalize message body for comparison (trim whitespace, lowercase)
+    const normalizedBody = (messageBody || '').trim().toUpperCase();
+
+    // Find user by phone number
+    const { data: user, error: userError } = await supabaseAdmin
+      .from('users')
+      .select('id, email, sms_opted_in')
+      .eq('phone', fromPhone)
+      .single();
+
+    if (userError || !user) {
+      console.log(`[SMS Webhook] ⚠️ Unknown phone number: ${fromPhone}`);
+      // Respond to Twilio (200 OK required to prevent retries)
+      return res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+    }
+
+    // Handle YES opt-in confirmation
+    if (normalizedBody === 'YES' || normalizedBody === 'Y') {
+      if (user.sms_opted_in) {
+        console.log(`[SMS Webhook] ℹ️ User ${user.email} already opted in`);
+      } else {
+        // Update opt-in status
+        const { error: updateError } = await supabaseAdmin
+          .from('users')
+          .update({
+            sms_opted_in: true,
+            sms_consent_timestamp: new Date().toISOString()
+          })
+          .eq('id', user.id);
+
+        if (updateError) {
+          console.error(`[SMS Webhook] ❌ Failed to update opt-in status: ${updateError.message}`);
+        } else {
+          console.log(`[SMS Webhook] ✅ User ${user.email} opted in to SMS`);
+          
+          // Log the opt-in action
+          await supabaseAdmin.from('action_logs').insert({
+            user_id: user.id,
+            action_type: 'sms_opt_in_confirmed',
+            payload_json: { phone: fromPhone, message: messageBody },
+            status: 'completed',
+            provider: 'twilio',
+            provider_id: MessageSid,
+            completed_at: new Date().toISOString()
+          });
+        }
+      }
+
+      // Send confirmation reply
+      const twilio = require('twilio');
+      const twilioResponse = new twilio.twiml.MessagingResponse();
+      twilioResponse.message('Thank you! You are now opted in to receive SMS notifications from SpokenNotes. Reply STOP to opt out anytime.');
+      
+      res.type('text/xml');
+      return res.send(twilioResponse.toString());
+    }
+
+    // Handle STOP opt-out (Twilio handles this automatically, but we log it)
+    if (normalizedBody === 'STOP' || normalizedBody === 'UNSUBSCRIBE') {
+      const { error: updateError } = await supabaseAdmin
+        .from('users')
+        .update({ sms_opted_in: false })
+        .eq('id', user.id);
+
+      if (!updateError) {
+        console.log(`[SMS Webhook] 🛑 User ${user.email} opted out of SMS`);
+        await supabaseAdmin.from('action_logs').insert({
+          user_id: user.id,
+          action_type: 'sms_opt_out',
+          payload_json: { phone: fromPhone, message: messageBody },
+          status: 'completed',
+          provider: 'twilio',
+          provider_id: MessageSid,
+          completed_at: new Date().toISOString()
+        });
+      }
+    }
+
+    // For all other messages, just acknowledge (Twilio will send automatic HELP/STOP responses)
+    res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+    
+  } catch (error) {
+    console.error('[SMS Webhook] ❌ Error:', error);
+    // Always return 200 to prevent Twilio retries on transient errors
+    res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
+  }
+});
+
+/**
+ * POST /api/webhooks/twilio-status
+ * Twilio webhook for SMS delivery status updates
+ * Called automatically by Twilio when message status changes
+ * Updates action_logs with final delivery status
+ * 
+ * Configure in Twilio Console OR use statusCallback parameter in messages.create()
+ * Statuses: queued, sent, delivered, failed, undelivered
+ */
+app.post('/api/webhooks/twilio-status', async (req, res) => {
+  try {
+    const { MessageSid, MessageStatus, To, From, ErrorCode } = req.body;
+    
+    console.log(`[SMS Status] 📊 ${MessageSid}: ${MessageStatus}${ErrorCode ? ` (Error: ${ErrorCode})` : ''}`);
+
+    // Update action_logs with delivery status
+    const { data: existingLog, error: findError } = await supabaseAdmin
+      .from('action_logs')
+      .select('id, status')
+      .eq('provider_id', MessageSid)
+      .eq('provider', 'twilio')
+      .single();
+
+    if (findError || !existingLog) {
+      console.log(`[SMS Status] ⚠️  No action_log found for ${MessageSid}`);
+      return res.status(200).send('OK'); // Still return 200 to prevent retries
+    }
+
+    // Map Twilio status to our delivery_status
+    const deliveryStatusMap = {
+      'queued': 'queued',
+      'sent': 'sent',
+      'delivered': 'delivered',
+      'failed': 'failed',
+      'undelivered': 'undelivered'
+    };
+
+    const deliveryStatus = deliveryStatusMap[MessageStatus] || MessageStatus;
+
+    // Update the log
+    const { error: updateError } = await supabaseAdmin
+      .from('action_logs')
+      .update({
+        delivery_status: deliveryStatus,
+        carrier_status_code: ErrorCode || null,
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', existingLog.id);
+
+    if (updateError) {
+      console.error(`[SMS Status] ❌ Failed to update log: ${updateError.message}`);
+    } else {
+      console.log(`[SMS Status] ✅ Updated ${MessageSid} → ${deliveryStatus}`);
+    }
+
+    res.status(200).send('OK');
+  } catch (error) {
+    console.error('[SMS Status Webhook] ❌ Error:', error);
+    // Always return 200 to prevent Twilio retries
+    res.status(200).send('OK');
   }
 });
 
@@ -2309,10 +2808,10 @@ app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
 
     if (userError) {
       console.error(`[DOCX] ❌ Failed to fetch user quota: ${userError.message}`);
-      return res.status(500).json({ 
-        success: false, 
-        request_id, 
-        error: 'Failed to check storage quota' 
+      return res.status(500).json({
+        success: false,
+        request_id,
+        error: 'Failed to check storage quota'
       });
     }
 
@@ -2321,7 +2820,7 @@ app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
 
     if (storageUsed + fileSize > storageLimit) {
       console.log(`[DOCX] ⚠️ Quota exceeded: ${storageUsed}/${storageLimit} bytes, need ${fileSize} more`);
-      
+
       await supabaseAdmin.from('action_logs').insert({
         request_id,
         user_id: userId,
@@ -2361,7 +2860,7 @@ app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
 
     if (uploadError) {
       console.error(`[DOCX] ❌ Upload failed: ${uploadError.message}`);
-      
+
       await supabaseAdmin.from('action_logs').insert({
         request_id,
         user_id: userId,
@@ -2413,9 +2912,9 @@ app.post('/api/assistant/create-docx', authenticateUser, async (req, res) => {
       request_id,
       user_id: userId,
       action_type: 'create_docx',
-      payload_json: { 
-        filename: safeFilename, 
-        content, 
+      payload_json: {
+        filename: safeFilename,
+        content,
         file_size: fileSize,
         storage_path: storagePath,
         storage_provider: 'supabase'
@@ -2513,10 +3012,10 @@ app.post('/api/assistant/create-xlsx', authenticateUser, async (req, res) => {
 
     if (userError) {
       console.error(`[XLSX] ❌ Failed to fetch user quota: ${userError.message}`);
-      return res.status(500).json({ 
-        success: false, 
-        request_id, 
-        error: 'Failed to check storage quota' 
+      return res.status(500).json({
+        success: false,
+        request_id,
+        error: 'Failed to check storage quota'
       });
     }
 
@@ -2525,7 +3024,7 @@ app.post('/api/assistant/create-xlsx', authenticateUser, async (req, res) => {
 
     if (storageUsed + fileSize > storageLimit) {
       console.log(`[XLSX] ⚠️ Quota exceeded: ${storageUsed}/${storageLimit} bytes, need ${fileSize} more`);
-      
+
       await supabaseAdmin.from('action_logs').insert({
         request_id,
         user_id: userId,
@@ -2565,7 +3064,7 @@ app.post('/api/assistant/create-xlsx', authenticateUser, async (req, res) => {
 
     if (uploadError) {
       console.error(`[XLSX] ❌ Upload failed: ${uploadError.message}`);
-      
+
       await supabaseAdmin.from('action_logs').insert({
         request_id,
         user_id: userId,
@@ -2617,9 +3116,9 @@ app.post('/api/assistant/create-xlsx', authenticateUser, async (req, res) => {
       request_id,
       user_id: userId,
       action_type: 'create_xlsx',
-      payload_json: { 
-        filename: safeFilename, 
-        content, 
+      payload_json: {
+        filename: safeFilename,
+        content,
         data,
         file_size: fileSize,
         storage_path: storagePath,
@@ -2689,7 +3188,7 @@ app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, r
     // Check Google Calendar configuration
     if (!process.env.GOOGLE_CALENDAR_CLIENT_ID || !process.env.GOOGLE_CALENDAR_CLIENT_SECRET) {
       console.log('[CALENDAR] ⚠️ Google Calendar not configured');
-      
+
       await supabaseAdmin.from('action_logs').insert({
         request_id,
         user_id: userId,
@@ -2699,11 +3198,11 @@ app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, r
         provider: 'google_calendar',
         error_message: 'Calendar service not configured'
       });
-      
-      return res.status(503).json({ 
-        success: false, 
-        request_id, 
-        error: 'Calendar service not configured. Please provide Google Calendar API credentials.' 
+
+      return res.status(503).json({
+        success: false,
+        request_id,
+        error: 'Calendar service not configured. Please provide Google Calendar API credentials.'
       });
     }
 
@@ -2716,7 +3215,7 @@ app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, r
 
     if (userError || !user) {
       console.log('[CALENDAR] ❌ Failed to fetch user:', userError?.message);
-      
+
       await supabaseAdmin.from('action_logs').insert({
         request_id,
         user_id: userId,
@@ -2726,17 +3225,17 @@ app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, r
         provider: 'google_calendar',
         error_message: 'User not found'
       });
-      
-      return res.status(500).json({ 
-        success: false, 
-        request_id, 
-        error: 'Failed to fetch user data' 
+
+      return res.status(500).json({
+        success: false,
+        request_id,
+        error: 'Failed to fetch user data'
       });
     }
 
     if (!user.google_refresh_token) {
       console.log('[CALENDAR] ⚠️ User has not connected Google Calendar');
-      
+
       await supabaseAdmin.from('action_logs').insert({
         request_id,
         user_id: userId,
@@ -2746,12 +3245,12 @@ app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, r
         provider: 'google_calendar',
         error_message: 'Google Calendar not connected'
       });
-      
-      return res.status(401).json({ 
-        success: false, 
-        request_id, 
+
+      return res.status(401).json({
+        success: false,
+        request_id,
         error: 'Google Calendar not connected',
-        auth_url: '/auth/google/initiate' 
+        auth_url: '/auth/google/initiate'
       });
     }
 
@@ -2771,13 +3270,13 @@ app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, r
     const tomorrow = new Date();
     tomorrow.setDate(tomorrow.getDate() + 1);
     tomorrow.setHours(14, 0, 0, 0);
-    
+
     const eventEnd = new Date(tomorrow);
     eventEnd.setHours(15, 0, 0, 0);
 
     // Create calendar event
     const calendar = google.calendar({ version: 'v3', auth: oauth2Client });
-    
+
     const event = {
       summary: title,
       description: content || rawContent || '',
@@ -2798,7 +3297,7 @@ app.post('/api/assistant/create-calendar-event', authenticateUser, async (req, r
 
     const eventId = calendarResponse.data.id;
     const eventLink = calendarResponse.data.htmlLink;
-    
+
     const duration = Date.now() - requestStart;
     console.log(`[CALENDAR] ✅ Created in ${duration}ms: ${eventId} request_id=${request_id}`);
 
