@@ -1073,6 +1073,18 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
 
     console.log(`💾 Transcription saved for ${recordingId}`);
 
+    // Log audio file to user_files for archiving
+    await supabaseAdmin.rpc('log_user_file', {
+      p_user_id: userId,
+      p_request_id: recordingId,
+      p_file_name: req.file.originalname,
+      p_file_type: 'audio',
+      p_file_size_bytes: req.file.size,
+      p_storage_path: filePath,
+      p_duration_seconds: parseInt(duration) || 0,
+      p_metadata_json: { transcription_length: transcription.text.length, status: 'completed' }
+    });
+
     // Return response with transcription included
     res.status(201).json({
       success: true,
@@ -2017,6 +2029,24 @@ app.post('/api/assistant/create-excel', authenticateUser, async (req, res) => {
       .from('assistant-files')
       .getPublicUrl(filePath);
 
+    // Log to user_files for archiving
+    const requestId = uuidv4();
+    await supabaseAdmin.rpc('log_user_file', {
+      p_user_id: userId,
+      p_request_id: requestId,
+      p_file_name: filename,
+      p_file_type: 'xlsx',
+      p_file_size_bytes: buffer.length,
+      p_storage_path: filePath,
+      p_metadata_json: { type: 'assistant-generated', has_structured_data: !!data }
+    });
+
+    // Increment storage usage
+    await supabaseAdmin.rpc('increment_storage_usage', {
+      user_id_param: userId,
+      bytes: buffer.length
+    });
+
     console.log(`✅ Excel file created: ${filename} for user ${userId}`);
 
     res.json({
@@ -2091,6 +2121,26 @@ app.post('/api/assistant/create-pdf', authenticateUser, async (req, res) => {
     const { data: urlData } = supabaseAdmin.storage
       .from('assistant-files')
       .getPublicUrl(filePath);
+
+    // Log to user_files for archiving
+    const requestId = uuidv4();
+    const wordCount = content.split(/\s+/).length;
+    await supabaseAdmin.rpc('log_user_file', {
+      p_user_id: userId,
+      p_request_id: requestId,
+      p_file_name: filename,
+      p_file_type: 'pdf',
+      p_file_size_bytes: buffer.length,
+      p_storage_path: filePath,
+      p_word_count: wordCount,
+      p_metadata_json: { type: 'assistant-generated', title: title || null }
+    });
+
+    // Increment storage usage
+    await supabaseAdmin.rpc('increment_storage_usage', {
+      user_id_param: userId,
+      bytes: buffer.length
+    });
 
     console.log(`✅ PDF file created: ${filename} for user ${userId}`);
 
@@ -2169,6 +2219,26 @@ app.post('/api/assistant/create-word', authenticateUser, async (req, res) => {
     const { data: urlData } = supabaseAdmin.storage
       .from('assistant-files')
       .getPublicUrl(filePath);
+
+    // Log to user_files for archiving
+    const requestId = uuidv4();
+    const wordCount = content.split(/\s+/).length;
+    await supabaseAdmin.rpc('log_user_file', {
+      p_user_id: userId,
+      p_request_id: requestId,
+      p_file_name: filename,
+      p_file_type: 'docx',
+      p_file_size_bytes: buffer.length,
+      p_storage_path: filePath,
+      p_word_count: wordCount,
+      p_metadata_json: { type: 'assistant-generated', title: title || null }
+    });
+
+    // Increment storage usage
+    await supabaseAdmin.rpc('increment_storage_usage', {
+      user_id_param: userId,
+      bytes: buffer.length
+    });
 
     console.log(`✅ Word file created: ${filename} for user ${userId}`);
 
@@ -3782,6 +3852,258 @@ app.post('/api/billing/cleanup-orphaned-storage', authenticateUser, async (req, 
   } catch (err) {
     console.error('❌ Storage cleanup error:', err);
     res.status(500).json({ error: 'Failed to cleanup storage' });
+  }
+});
+
+// ============================================================================
+// FILE MANAGEMENT ENDPOINTS (Phase 1: Archive Foundation)
+// ============================================================================
+
+/**
+ * GET /api/files
+ * List user's files with pagination and filtering
+ * Query params:
+ *   - page: Page number (default: 1)
+ *   - limit: Items per page (default: 50, max: 200)
+ *   - type: Filter by file_type (audio, transcript, docx, xlsx, calendar, pdf)
+ *   - archived: Filter by archived status (true/false)
+ *   - search: Search in file_name
+ */
+app.get('/api/files', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const page = parseInt(req.query.page) || 1;
+    const limit = Math.min(parseInt(req.query.limit) || 50, 200);
+    const offset = (page - 1) * limit;
+    const fileType = req.query.type;
+    const archived = req.query.archived === 'true' ? true : req.query.archived === 'false' ? false : null;
+    const search = req.query.search;
+
+    console.log(`📂 File list request from user ${userId} (page ${page}, limit ${limit})`);
+
+    // Build query
+    let query = supabaseAdmin
+      .from('user_files')
+      .select('*', { count: 'exact' })
+      .eq('user_id', userId)
+      .eq('deleted', false);
+
+    // Apply filters
+    if (fileType) {
+      query = query.eq('file_type', fileType);
+    }
+    if (archived !== null) {
+      query = query.eq('archived', archived);
+    }
+    if (search) {
+      query = query.ilike('file_name', `%${search}%`);
+    }
+
+    // Sort by created_at DESC, with pagination
+    query = query
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1);
+
+    const { data: files, error, count } = await query;
+
+    if (error) {
+      console.error('❌ File list query error:', error);
+      return res.status(500).json({ error: 'Failed to list files' });
+    }
+
+    const totalPages = Math.ceil((count || 0) / limit);
+
+    console.log(`✅ Found ${count} files, returning page ${page}/${totalPages}`);
+
+    res.json({
+      success: true,
+      files: files || [],
+      pagination: {
+        page,
+        limit,
+        total_items: count,
+        total_pages: totalPages,
+        has_next: page < totalPages,
+        has_prev: page > 1
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ File list error:', err);
+    res.status(500).json({ error: 'Failed to list files' });
+  }
+});
+
+/**
+ * GET /api/files/:id
+ * Get detailed file information including signed URL for download
+ */
+app.get('/api/files/:id', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const fileId = req.params.id;
+
+    console.log(`📄 File details request: ${fileId} from user ${userId}`);
+
+    // Query file
+    const { data: file, error } = await supabaseAdmin
+      .from('user_files')
+      .select('*')
+      .eq('id', fileId)
+      .eq('user_id', userId)
+      .eq('deleted', false)
+      .single();
+
+    if (error || !file) {
+      console.error('❌ File not found or query error:', error);
+      return res.status(404).json({ error: 'File not found' });
+    }
+
+    // Generate signed URL for download (valid for 1 hour)
+    let downloadUrl = null;
+    if (file.storage_path) {
+      // Check if storage_path starts with http (external URL)
+      if (file.storage_path.startsWith('http')) {
+        downloadUrl = file.storage_path;
+      } else {
+        // Generate signed URL from Supabase Storage
+        const { data: signedUrlData, error: signedError } = await supabaseAdmin.storage
+          .from('recordings')
+          .createSignedUrl(file.storage_path, 3600); // 1 hour expiry
+
+        if (!signedError && signedUrlData) {
+          downloadUrl = signedUrlData.signedUrl;
+        } else {
+          console.error('⚠️ Failed to generate signed URL:', signedError);
+        }
+      }
+    }
+
+    console.log(`✅ File found: ${file.file_name} (${file.file_type})`);
+
+    res.json({
+      success: true,
+      file: {
+        ...file,
+        download_url: downloadUrl,
+        download_url_expires_at: downloadUrl ? new Date(Date.now() + 3600000).toISOString() : null
+      }
+    });
+
+  } catch (err) {
+    console.error('❌ File details error:', err);
+    res.status(500).json({ error: 'Failed to get file details' });
+  }
+});
+
+/**
+ * PATCH /api/files/:id/archive
+ * Toggle archive status of a file
+ */
+app.patch('/api/files/:id/archive', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const fileId = req.params.id;
+    const { archived } = req.body; // true or false
+
+    if (typeof archived !== 'boolean') {
+      return res.status(400).json({ error: 'archived field must be boolean' });
+    }
+
+    console.log(`📦 Archive toggle: ${fileId} -> ${archived} by user ${userId}`);
+
+    // Update file
+    const { data: file, error } = await supabaseAdmin
+      .from('user_files')
+      .update({
+        archived,
+        archived_at: archived ? new Date().toISOString() : null
+      })
+      .eq('id', fileId)
+      .eq('user_id', userId)
+      .eq('deleted', false)
+      .select()
+      .single();
+
+    if (error || !file) {
+      console.error('❌ Archive update error:', error);
+      return res.status(404).json({ error: 'File not found or already deleted' });
+    }
+
+    console.log(`✅ File ${archived ? 'archived' : 'unarchived'}: ${file.file_name}`);
+
+    res.json({
+      success: true,
+      file,
+      message: archived ? 'File archived' : 'File unarchived'
+    });
+
+  } catch (err) {
+    console.error('❌ Archive toggle error:', err);
+    res.status(500).json({ error: 'Failed to toggle archive status' });
+  }
+});
+
+/**
+ * DELETE /api/files/:id
+ * Soft delete a file and decrement storage usage
+ */
+app.delete('/api/files/:id', authenticateUser, async (req, res) => {
+  try {
+    const userId = req.user.id;
+    const fileId = req.params.id;
+
+    console.log(`🗑️ File deletion request: ${fileId} from user ${userId}`);
+
+    // Get file details first
+    const { data: file, error: queryError } = await supabaseAdmin
+      .from('user_files')
+      .select('*')
+      .eq('id', fileId)
+      .eq('user_id', userId)
+      .eq('deleted', false)
+      .single();
+
+    if (queryError || !file) {
+      console.error('❌ File not found:', queryError);
+      return res.status(404).json({ error: 'File not found or already deleted' });
+    }
+
+    // Soft delete the file
+    const { error: deleteError } = await supabaseAdmin
+      .from('user_files')
+      .update({
+        deleted: true,
+        deleted_at: new Date().toISOString()
+      })
+      .eq('id', fileId);
+
+    if (deleteError) {
+      console.error('❌ Soft delete error:', deleteError);
+      return res.status(500).json({ error: 'Failed to delete file' });
+    }
+
+    // Decrement storage usage
+    const { error: storageError } = await supabaseAdmin.rpc('decrement_storage_usage', {
+      user_id_param: userId,
+      bytes: file.file_size_bytes
+    });
+
+    if (storageError) {
+      console.error('⚠️ Storage decrement error (continuing):', storageError);
+    }
+
+    console.log(`✅ File soft-deleted: ${file.file_name} (freed ${Math.round(file.file_size_bytes / 1024)} KB)`);
+
+    res.json({
+      success: true,
+      message: 'File deleted',
+      bytes_freed: file.file_size_bytes
+    });
+
+  } catch (err) {
+    console.error('❌ File deletion error:', err);
+    res.status(500).json({ error: 'Failed to delete file' });
   }
 });
 
