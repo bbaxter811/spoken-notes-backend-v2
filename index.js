@@ -455,10 +455,23 @@ try {
 // ============================================================================
 
 /**
+ * ⚠️ APPROXIMATE TOKEN ESTIMATOR - NOT BILLABLE-ACCURATE
+ * 
  * Estimate token count from text using ~4 characters per token rule
  * This is a server-side approximation for billing/metering purposes
+ * 
+ * LIMITATIONS:
+ * - Does NOT use OpenAI's official tokenizer (tiktoken)
+ * - Variance can be ±20% from actual token counts
+ * - Good for quotas/caps, NOT for customer invoicing
+ * 
+ * SAFE FOR: Monthly caps, usage display, quota enforcement
+ * NOT SAFE FOR: Billing customers, revenue calculations, invoicing
+ * 
+ * TODO: Replace with official tokenizer library (e.g., gpt-tokenizer) before billing
+ * 
  * @param {string} text - Text to estimate tokens for
- * @returns {number} Estimated token count
+ * @returns {number} Estimated token count (approximate)
  */
 function estimateTokens(text) {
   if (!text) return 0;
