@@ -450,6 +450,86 @@ try {
   console.error('⚠️  OpenAI initialization warning:', err.message);
 }
 
+// ============================================================================
+// AI USAGE METERING HELPERS (Phase 2)
+// ============================================================================
+
+/**
+ * Estimate token count from text using ~4 characters per token rule
+ * This is a server-side approximation for billing/metering purposes
+ * @param {string} text - Text to estimate tokens for
+ * @returns {number} Estimated token count
+ */
+function estimateTokens(text) {
+  if (!text) return 0;
+  // OpenAI rule of thumb: ~4 characters per token
+  // Add word count * 1.3 as alternative method, take average
+  const charMethod = Math.ceil(text.length / 4);
+  const wordMethod = Math.ceil(text.split(/\s+/).length * 1.3);
+  return Math.ceil((charMethod + wordMethod) / 2);
+}
+
+/**
+ * Convert tokens to AI minutes using pricing model
+ * Formula: 1 AI minute = 1000 tokens (can be adjusted based on business model)
+ * @param {number} tokens - Total tokens (input + output)
+ * @returns {number} AI minutes (decimal)
+ */
+function tokensToMinutes(tokens) {
+  if (!tokens) return 0;
+  // 1 AI minute = 1000 tokens (adjustable)
+  return tokens / 1000;
+}
+
+/**
+ * Log AI usage to database (both detail log + monthly aggregate)
+ * @param {UUID} userId - User ID
+ * @param {string} requestId - Request ID for traceability
+ * @param {string} kind - Usage type: 'transcribe', 'chat', 'docx', 'xlsx', 'pdf', 'email', 'sms'
+ * @param {object} usage - Usage details { audio_seconds, llm_input_tokens, llm_output_tokens, model }
+ */
+async function logAiUsage(userId, requestId, kind, usage) {
+  try {
+    // Calculate AI minutes
+    let aiMinutes = 0;
+    
+    // Audio-based: audio_seconds / 60 (authoritative for transcription)
+    if (usage.audio_seconds) {
+      aiMinutes += usage.audio_seconds / 60;
+    }
+    
+    // LLM-based: convert tokens to minutes
+    const totalTokens = (usage.llm_input_tokens || 0) + (usage.llm_output_tokens || 0);
+    if (totalTokens > 0) {
+      aiMinutes += tokensToMinutes(totalTokens);
+    }
+    
+    // Log to database using RPC function
+    const { error } = await supabaseAdmin.rpc('log_ai_usage', {
+      p_user_id: userId,
+      p_request_id: requestId,
+      p_kind: kind,
+      p_ai_minutes: aiMinutes,
+      p_audio_seconds: usage.audio_seconds || null,
+      p_llm_input_tokens_est: usage.llm_input_tokens || null,
+      p_llm_output_tokens_est: usage.llm_output_tokens || null,
+      p_model_used: usage.model || null,
+      p_metadata_json: usage.metadata || {}
+    });
+    
+    if (error) {
+      console.error(`⚠️ Failed to log AI usage for ${kind}:`, error);
+    } else {
+      console.log(`📊 AI usage logged: ${kind} = ${aiMinutes.toFixed(4)} minutes (user ${userId})`);
+    }
+    
+    return aiMinutes;
+  } catch (err) {
+    console.error('❌ logAiUsage error:', err);
+    return 0;
+  }
+}
+
 // Initialize SendGrid for email sending
 if (process.env.SENDGRID_API_KEY) {
   try {
@@ -893,6 +973,14 @@ app.post('/api/voice-command/transcribe', authenticateUser, upload.single('audio
 
     console.log(`✅ Voice command transcribed: "${transcription.text}"`);
 
+    // Log AI usage (estimate 3 seconds for voice command snippets)
+    const estimatedDuration = 3; // Voice commands are typically 3-second snippets
+    await logAiUsage(req.user.id, uuidv4(), 'transcribe', {
+      audio_seconds: estimatedDuration,
+      model: 'whisper-1',
+      metadata: { type: 'voice_command', text_length: transcription.text.length }
+    });
+
     // Return transcript immediately
     res.json({
       success: true,
@@ -1074,6 +1162,7 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
     console.log(`💾 Transcription saved for ${recordingId}`);
 
     // Log audio file to user_files for archiving
+    const aiMinutes = parseInt(duration) || 0 / 60; // Calculate AI minutes from audio duration
     await supabaseAdmin.rpc('log_user_file', {
       p_user_id: userId,
       p_request_id: recordingId,
@@ -1082,7 +1171,14 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
       p_file_size_bytes: req.file.size,
       p_storage_path: filePath,
       p_duration_seconds: parseInt(duration) || 0,
+      p_ai_minutes_used: aiMinutes,
       p_metadata_json: { transcription_length: transcription.text.length, status: 'completed' }
+    });
+
+    // Log AI usage (transcription = audio_seconds / 60)
+    await logAiUsage(userId, recordingId, 'transcribe', {
+      audio_seconds: parseInt(duration) || 0,
+      model: 'whisper-1'
     });
 
     // Return response with transcription included
@@ -1489,6 +1585,18 @@ Be conversational, accurate with names/recipients, and wait for confirmation.`;
     });
 
     const response = completion.choices[0].message.content;
+
+    // Log AI usage (estimate tokens from messages)
+    const promptText = messages.map(m => m.content).join(' ');
+    const inputTokens = estimateTokens(promptText);
+    const outputTokens = estimateTokens(response);
+    
+    await logAiUsage(userId, uuidv4(), 'chat', {
+      llm_input_tokens: inputTokens,
+      llm_output_tokens: outputTokens,
+      model: 'gpt-4o',
+      metadata: { retrieval_mode: retrievalMode, history_length: conversationHistory.length }
+    });
 
     res.json({
       success: true,
@@ -3655,6 +3763,12 @@ app.get('/api/billing/usage', authenticateUser, async (req, res) => {
       alertLevel = 'warning';
     }
 
+    // Get AI minutes used this month
+    const { data: aiMinutesData } = await supabaseAdmin.rpc('get_ai_usage_this_month', {
+      p_user_id: userId
+    });
+    const aiMinutesUsed = aiMinutesData || 0;
+
     const usage = {
       total_bytes: totalBytes,
       audio_bytes: audioBytes,
@@ -3662,10 +3776,11 @@ app.get('/api/billing/usage', authenticateUser, async (req, res) => {
       cap_bytes: capBytes,
       percent_used: percentUsed,
       alert_level: alertLevel,
+      ai_minutes_used_this_month: parseFloat(aiMinutesUsed),
       tier: 'free' // TODO: Read from user subscription table when implemented
     };
 
-    console.log(`✅ Usage: ${totalBytes} / ${capBytes} bytes (${percentUsed}%)`);
+    console.log(`✅ Usage: ${totalBytes} / ${capBytes} bytes (${percentUsed}%), AI minutes: ${aiMinutesUsed}`);
 
     res.json({
       success: true,
