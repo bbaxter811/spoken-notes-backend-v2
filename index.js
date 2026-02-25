@@ -20,6 +20,8 @@ process.on("exit", (code) => {
 
 const express = require('express');
 const cors = require('cors');
+const helmet = require('helmet');
+const rateLimit = require('express-rate-limit');
 const multer = require('multer');
 const path = require('path');
 const { createClient } = require('@supabase/supabase-js');
@@ -505,18 +507,18 @@ async function logAiUsage(userId, requestId, kind, usage) {
   try {
     // Calculate AI minutes
     let aiMinutes = 0;
-    
+
     // Audio-based: audio_seconds / 60 (authoritative for transcription)
     if (usage.audio_seconds) {
       aiMinutes += usage.audio_seconds / 60;
     }
-    
+
     // LLM-based: convert tokens to minutes
     const totalTokens = (usage.llm_input_tokens || 0) + (usage.llm_output_tokens || 0);
     if (totalTokens > 0) {
       aiMinutes += tokensToMinutes(totalTokens);
     }
-    
+
     // Log to database using RPC function
     const { error } = await supabaseAdmin.rpc('log_ai_usage', {
       p_user_id: userId,
@@ -529,13 +531,13 @@ async function logAiUsage(userId, requestId, kind, usage) {
       p_model_used: usage.model || null,
       p_metadata_json: usage.metadata || {}
     });
-    
+
     if (error) {
       console.error(`⚠️ Failed to log AI usage for ${kind}:`, error);
     } else {
       console.log(`📊 AI usage logged: ${kind} = ${aiMinutes.toFixed(4)} minutes (user ${userId})`);
     }
-    
+
     return aiMinutes;
   } catch (err) {
     console.error('❌ logAiUsage error:', err);
@@ -563,8 +565,55 @@ const upload = multer({
   }
 });
 
-// CORS middleware
-app.use(cors());
+// ============================================================================
+// SECURITY MIDDLEWARE
+// ============================================================================
+
+// Helmet: Security headers (XSS, clickjacking, MIME sniffing protection)
+app.use(helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc: ["'self'"],
+      styleSrc: ["'self'", "'unsafe-inline'"],
+      scriptSrc: ["'self'"],
+      imgSrc: ["'self'", "data:", "https:"]
+    }
+  },
+  hsts: {
+    maxAge: 31536000, // 1 year
+    includeSubDomains: true,
+    preload: true
+  }
+}));
+
+// CORS: Restrict to admin dashboard origins only
+const allowedOrigins = [
+  'https://admin.spokennotes.com',
+  'https://admin-dashboard.spokennotes.com',
+  process.env.ADMIN_DASHBOARD_URL,
+  process.env.NODE_ENV === 'development' ? 'http://localhost:3000' : null,
+  process.env.NODE_ENV === 'development' ? 'http://localhost:3001' : null,
+].filter(Boolean);
+
+app.use(cors({
+  origin: function (origin, callback) {
+    // Allow requests with no origin (mobile apps, server-to-server)
+    if (!origin) return callback(null, true);
+    
+    if (allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      console.warn(`⚠️ CORS blocked: ${origin}`);
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization'],
+  maxAge: 86400 // 24 hours
+}));
+
+console.log('✅ Security middleware initialized (Helmet + CORS)');
 
 // Auth middleware
 const authenticateUser = async (req, res, next) => {
@@ -594,9 +643,9 @@ const authenticateUser = async (req, res, next) => {
 // SMS Rate Limiting Helper
 async function checkSmsRateLimit(userId, userPlan) {
   const now = new Date();
-  
+
   // Get or create rate limit record
-  let { data: rateLimitData, error} = await supabaseAdmin
+  let { data: rateLimitData, error } = await supabaseAdmin
     .from('sms_rate_limits')
     .select('*')
     .eq('user_id', userId)
@@ -649,22 +698,22 @@ async function checkSmsRateLimit(userId, userPlan) {
 
   // Check limits
   if (rateLimitData.minute_count >= planLimits.minute && planLimits.minute > 0) {
-    return { 
-      allowed: false, 
+    return {
+      allowed: false,
       reason: `Minute limit exceeded (${planLimits.minute}/min)`,
       retry_after: Math.ceil((new Date(rateLimitData.minute_reset_at).getTime() + 60000 - now.getTime()) / 1000)
     };
   }
   if (rateLimitData.hour_count >= planLimits.hour && planLimits.hour > 0) {
-    return { 
-      allowed: false, 
+    return {
+      allowed: false,
       reason: `Hour limit exceeded (${planLimits.hour}/hour)`,
       retry_after: Math.ceil((new Date(rateLimitData.hour_reset_at).getTime() + 3600000 - now.getTime()) / 1000)
     };
   }
   if (rateLimitData.day_count >= planLimits.day && planLimits.day > 0) {
-    return { 
-      allowed: false, 
+    return {
+      allowed: false,
       reason: `Daily limit exceeded (${planLimits.day}/day)`,
       retry_after: Math.ceil((new Date(rateLimitData.day_reset_at).getTime() + 86400000 - now.getTime()) / 1000)
     };
@@ -1603,7 +1652,7 @@ Be conversational, accurate with names/recipients, and wait for confirmation.`;
     const promptText = messages.map(m => m.content).join(' ');
     const inputTokens = estimateTokens(promptText);
     const outputTokens = estimateTokens(response);
-    
+
     await logAiUsage(userId, uuidv4(), 'chat', {
       llm_input_tokens: inputTokens,
       llm_output_tokens: outputTokens,
@@ -1815,8 +1864,8 @@ app.post('/api/auth/signup', async (req, res) => {
     // Validate phone format if provided (E.164: +1XXXXXXXXXX)
     if (phone && !/^\+1\d{10}$/.test(phone)) {
       console.log('❌ Invalid phone format:', phone);
-      return res.status(400).json({ 
-        error: 'Invalid phone number format. Use +1XXXXXXXXXX (e.g., +14438004564)' 
+      return res.status(400).json({
+        error: 'Invalid phone number format. Use +1XXXXXXXXXX (e.g., +14438004564)'
       });
     }
 
@@ -1844,7 +1893,7 @@ app.post('/api/auth/signup', async (req, res) => {
       try {
         const clientIp = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
         const userAgent = req.headers['user-agent'] || 'unknown';
-        
+
         await supabase
           .from('user_consent_data')
           .upsert({
@@ -1854,7 +1903,7 @@ app.post('/api/auth/signup', async (req, res) => {
             consent_user_agent: userAgent,
             plan: 'free' // Default plan for new signups
           });
-        
+
         console.log(`✅ Consent logged: method=web_signup ip=${clientIp}`);
       } catch (consentError) {
         console.error('⚠️  Failed to log consent metadata:', consentError);
@@ -2526,7 +2575,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
       .single();
 
     const userPlan = userPlanData?.plan || 'free';
-    
+
     // Free plan: No SMS access
     if (userPlan === 'free') {
       console.log(`[SMS] 🚫 Free plan user attempted SMS: user=${userId}`);
@@ -2573,7 +2622,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
     // Handle "SELF" marker - send to user's own phone (like email does with req.user.email)
     let actualRecipient = recipient;
     let userPhoneData = null;
-    
+
     if (recipient === 'SELF') {
       // Get user's phone and opt-in status from database (join with consent data)
       const { data: userData, error: userError } = await supabaseAdmin
@@ -2581,7 +2630,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
         .select('phone, sms_opted_in, sms_consent_timestamp, user_consent_data(consent_method)')
         .eq('id', userId)
         .single();
-      
+
       // Flatten consent_method from joined table
       if (userData && userData.user_consent_data) {
         userData.consent_method = userData.user_consent_data[0]?.consent_method;
@@ -2589,7 +2638,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
 
       if (userError || !userData?.phone) {
         console.error(`[SMS] ❌ SELF recipient but no phone in database: request_id=${request_id} error=${userError?.message}`);
-        
+
         await supabaseAdmin.from('action_logs').insert({
           request_id,
           user_id: userId,
@@ -2617,7 +2666,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
     // If user hasn't opted in yet, send confirmation SMS instead
     if (recipient === 'SELF' && userPhoneData && !userPhoneData.sms_opted_in) {
       console.log(`[SMS] 🔔 User hasn't opted in to SMS yet - sending opt-in confirmation`);
-      
+
       // Check if Twilio is configured
       if (!process.env.TWILIO_ACCOUNT_SID || !process.env.TWILIO_AUTH_TOKEN || !process.env.TWILIO_PHONE_NUMBER) {
         console.warn(`[SMS] ⚠️ Twilio not configured - request_id=${request_id}`);
@@ -2704,7 +2753,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
       try {
         const clientIp = req.headers['x-forwarded-for']?.split(',')[0] || req.socket.remoteAddress || 'unknown';
         const userAgent = req.headers['user-agent'] || 'unknown';
-        
+
         await supabaseAdmin
           .from('user_consent_data')
           .upsert({
@@ -2713,7 +2762,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
             consent_ip: clientIp,
             consent_user_agent: userAgent
           });
-        
+
         console.log(`[SMS] ✅ Consent source logged: method=voice_command ip=${clientIp}`);
       } catch (consentError) {
         console.error('[SMS] ⚠️  Failed to log consent source:', consentError);
@@ -2789,7 +2838,7 @@ app.post('/api/assistant/send-sms', authenticateUser, async (req, res) => {
 app.post('/api/webhooks/twilio-sms', async (req, res) => {
   try {
     const { From: fromPhone, Body: messageBody, MessageSid } = req.body;
-    
+
     console.log(`[SMS Webhook] 📨 Received from ${fromPhone}: "${messageBody}" (${MessageSid})`);
 
     // Normalize message body for comparison (trim whitespace, lowercase)
@@ -2826,7 +2875,7 @@ app.post('/api/webhooks/twilio-sms', async (req, res) => {
           console.error(`[SMS Webhook] ❌ Failed to update opt-in status: ${updateError.message}`);
         } else {
           console.log(`[SMS Webhook] ✅ User ${user.email} opted in to SMS`);
-          
+
           // Log the opt-in action
           await supabaseAdmin.from('action_logs').insert({
             user_id: user.id,
@@ -2844,7 +2893,7 @@ app.post('/api/webhooks/twilio-sms', async (req, res) => {
       const twilio = require('twilio');
       const twilioResponse = new twilio.twiml.MessagingResponse();
       twilioResponse.message('Thank you! You are now opted in to receive SMS notifications from SpokenNotes. Reply STOP to opt out anytime.');
-      
+
       res.type('text/xml');
       return res.send(twilioResponse.toString());
     }
@@ -2872,7 +2921,7 @@ app.post('/api/webhooks/twilio-sms', async (req, res) => {
 
     // For all other messages, just acknowledge (Twilio will send automatic HELP/STOP responses)
     res.status(200).send('<?xml version="1.0" encoding="UTF-8"?><Response></Response>');
-    
+
   } catch (error) {
     console.error('[SMS Webhook] ❌ Error:', error);
     // Always return 200 to prevent Twilio retries on transient errors
@@ -2892,7 +2941,7 @@ app.post('/api/webhooks/twilio-sms', async (req, res) => {
 app.post('/api/webhooks/twilio-status', async (req, res) => {
   try {
     const { MessageSid, MessageStatus, To, From, ErrorCode } = req.body;
-    
+
     console.log(`[SMS Status] 📊 ${MessageSid}: ${MessageStatus}${ErrorCode ? ` (Error: ${ErrorCode})` : ''}`);
 
     // Update action_logs with delivery status
@@ -3869,6 +3918,34 @@ app.get('/api/billing/subscription', authenticateUser, async (req, res) => {
     res.status(500).json({ error: 'Failed to retrieve subscription' });
   }
 });
+
+// ============================================================================
+// ADMIN DASHBOARD API
+// ============================================================================
+
+// Rate limiter for admin routes (prevent brute force and DoS)
+const adminLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 100, // 100 requests per 15 minutes per IP
+  message: { error: 'Too many admin requests. Please try again in 15 minutes.' },
+  standardHeaders: true, // Return rate limit info in `RateLimit-*` headers
+  legacyHeaders: false, // Disable `X-RateLimit-*` headers
+  skip: (req) => {
+    // Allow health checks to bypass rate limiting
+    return req.path === '/admin/health';
+  },
+  handler: (req, res) => {
+    console.warn(`⚠️ Admin rate limit exceeded: ${req.ip} - ${req.path}`);
+    res.status(429).json({ 
+      error: 'Too many admin requests. Please try again in 15 minutes.',
+      retryAfter: 900 // seconds
+    });
+  }
+});
+
+const adminRoutes = require('./adminRoutes')(supabaseAdmin);
+app.use('/admin', adminLimiter, adminRoutes);
+console.log('✅ Admin dashboard routes mounted at /admin/* (with rate limiting)');
 
 /**
  * POST /api/billing/cleanup-orphaned-storage
