@@ -599,7 +599,7 @@ app.use(cors({
   origin: function (origin, callback) {
     // Allow requests with no origin (mobile apps, server-to-server)
     if (!origin) return callback(null, true);
-    
+
     if (allowedOrigins.includes(origin)) {
       callback(null, true);
     } else {
@@ -3936,7 +3936,7 @@ const adminLimiter = rateLimit({
   },
   handler: (req, res) => {
     console.warn(`⚠️ Admin rate limit exceeded: ${req.ip} - ${req.path}`);
-    res.status(429).json({ 
+    res.status(429).json({
       error: 'Too many admin requests. Please try again in 15 minutes.',
       retryAfter: 900 // seconds
     });

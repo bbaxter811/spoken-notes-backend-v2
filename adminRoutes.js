@@ -23,16 +23,19 @@ async function authenticateAdmin(req, res, next) {
     }
 
     const token = authHeader.substring(7);
-    
+
     // Verify token with Supabase
     const { data: { user }, error } = await req.supabaseAdmin.auth.getUser(token);
-    
+
     if (error || !user) {
       console.error('❌ Admin auth failed - invalid token:', error);
       return res.status(401).json({ error: 'Invalid token' });
     }
 
+    console.log('[AUTH_ADMIN] JWT validated. userId=', user.id, 'email=', user.email);
+
     // Check if user is an admin
+    console.log('[AUTH_ADMIN] Querying table=admin_users for userId=', user.id);
     const { data: adminUser, error: adminError } = await req.supabaseAdmin
       .from('admin_users')
       .select('*')
@@ -40,17 +43,34 @@ async function authenticateAdmin(req, res, next) {
       .eq('is_active', true)
       .single();
 
-    if (adminError || !adminUser) {
-      console.error('❌ Admin check failed - user not an admin:', user.email);
-      return res.status(403).json({ error: 'Access denied - admin privileges required' });
+    if (adminError) {
+      console.error('[AUTH_ADMIN] Supabase query error:', {
+        userId: user.id,
+        email: user.email,
+        table: 'admin_users',
+        errorCode: adminError.code,
+        errorMessage: adminError.message,
+        errorDetails: adminError.details,
+        errorHint: adminError.hint
+      });
+      return res.status(403).json({ 
+        error: 'Admin access denied', 
+        detail: adminError.message,
+        code: adminError.code
+      });
+    }
+
+    if (!adminUser) {
+      console.error('[AUTH_ADMIN] No admin record found for userId=', user.id, 'email=', user.email);
+      return res.status(403).json({ error: 'Access denied - not in admin allowlist' });
     }
 
     // Attach user and admin info to request
     req.user = user;
     req.admin = adminUser;
-    
+
     console.log(`✅ Admin authenticated: ${user.email} (${adminUser.admin_level})`);
-    
+
     next();
   } catch (err) {
     console.error('❌ Admin authentication error:', err);
@@ -102,15 +122,15 @@ async function logAdminAction(supabaseAdmin, adminUser, targetUserId, targetUser
  */
 router.get('/health', async (req, res) => {
   try {
-    res.status(200).json({ 
+    res.status(200).json({
       status: 'ok',
       service: 'admin-routes',
       timestamp: new Date().toISOString()
     });
   } catch (err) {
-    res.status(500).json({ 
+    res.status(500).json({
       status: 'error',
-      error: err.message 
+      error: err.message
     });
   }
 });
@@ -258,7 +278,7 @@ router.get('/users', authenticateAdmin, async (req, res) => {
   try {
     const searchTerm = req.query.search || '';
     const limit = Math.min(parseInt(req.query.limit) || 50, 200);
-    
+
     console.log(`🔍 Admin user search: "${searchTerm}" (limit ${limit})`);
 
     // Use the admin_search_users function
@@ -290,7 +310,7 @@ router.get('/users', authenticateAdmin, async (req, res) => {
 router.get('/users/:id', authenticateAdmin, async (req, res) => {
   try {
     const userId = req.params.id;
-    
+
     console.log(`👤 Admin user detail request: ${userId}`);
 
     // Use the admin_get_user_detail function
@@ -341,14 +361,14 @@ router.post('/users/:id/quotas', authenticateAdmin, async (req, res) => {
 
     // Validation
     if (!action || !quota_type || !reason) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: action, quota_type, reason' 
+      return res.status(400).json({
+        error: 'Missing required fields: action, quota_type, reason'
       });
     }
 
     if ((action === 'add' || action === 'set') && (value === undefined || value === null)) {
-      return res.status(400).json({ 
-        error: 'Value is required for add/set actions' 
+      return res.status(400).json({
+        error: 'Value is required for add/set actions'
       });
     }
 
@@ -376,8 +396,8 @@ router.post('/users/:id/quotas', authenticateAdmin, async (req, res) => {
           .eq('month', currentMonth)
           .single();
 
-        beforeState = { 
-          ai_minutes_used: monthlyUsage?.ai_minutes_used || 0 
+        beforeState = {
+          ai_minutes_used: monthlyUsage?.ai_minutes_used || 0
         };
 
         // Perform action
@@ -388,9 +408,9 @@ router.post('/users/:id/quotas', authenticateAdmin, async (req, res) => {
             .update({ ai_minutes_used: 0, updated_at: new Date().toISOString() })
             .eq('user_id', targetUserId)
             .eq('month', currentMonth);
-          
+
           afterState = { ai_minutes_used: 0 };
-          
+
         } else if (action === 'add') {
           // Add to current value
           const newValue = parseFloat(beforeState.ai_minutes_used) + parseFloat(value);
@@ -402,9 +422,9 @@ router.post('/users/:id/quotas', authenticateAdmin, async (req, res) => {
               ai_minutes_used: newValue,
               updated_at: new Date().toISOString()
             });
-          
+
           afterState = { ai_minutes_used: newValue };
-          
+
         } else if (action === 'set') {
           // Set absolute value
           await req.supabaseAdmin
@@ -415,7 +435,7 @@ router.post('/users/:id/quotas', authenticateAdmin, async (req, res) => {
               ai_minutes_used: parseFloat(value),
               updated_at: new Date().toISOString()
             });
-          
+
           afterState = { ai_minutes_used: parseFloat(value) };
         }
         break;
@@ -441,12 +461,12 @@ router.post('/users/:id/quotas', authenticateAdmin, async (req, res) => {
             .from('users')
             .update({ storage_used_bytes: 0 })
             .eq('id', targetUserId);
-          
-          afterState = { 
+
+          afterState = {
             storage_used_bytes: 0,
             storage_limit_bytes: beforeState.storage_limit_bytes
           };
-          
+
         } else if (action === 'add') {
           // Add to current limit
           const newLimit = parseInt(beforeState.storage_limit_bytes) + parseInt(value);
@@ -454,19 +474,19 @@ router.post('/users/:id/quotas', authenticateAdmin, async (req, res) => {
             .from('users')
             .update({ storage_limit_bytes: newLimit })
             .eq('id', targetUserId);
-          
+
           afterState = {
             storage_used_bytes: beforeState.storage_used_bytes,
             storage_limit_bytes: newLimit
           };
-          
+
         } else if (action === 'set') {
           // Set absolute limit
           await req.supabaseAdmin
             .from('users')
             .update({ storage_limit_bytes: parseInt(value) })
             .eq('id', targetUserId);
-          
+
           afterState = {
             storage_used_bytes: beforeState.storage_used_bytes,
             storage_limit_bytes: parseInt(value)
@@ -477,14 +497,14 @@ router.post('/users/:id/quotas', authenticateAdmin, async (req, res) => {
 
       case 'sms': {
         // TODO: Implement SMS quota tracking if needed
-        return res.status(501).json({ 
-          error: 'SMS quota adjustment not yet implemented' 
+        return res.status(501).json({
+          error: 'SMS quota adjustment not yet implemented'
         });
       }
 
       default:
-        return res.status(400).json({ 
-          error: 'Invalid quota_type. Must be: ai_minutes, sms, or storage' 
+        return res.status(400).json({
+          error: 'Invalid quota_type. Must be: ai_minutes, sms, or storage'
         });
     }
 
@@ -540,20 +560,20 @@ router.post('/users/:id/credits', authenticateAdmin, async (req, res) => {
 
     // Validation
     if (!credit_type || !amount || !reason) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: credit_type, amount, reason' 
+      return res.status(400).json({
+        error: 'Missing required fields: credit_type, amount, reason'
       });
     }
 
     if (!['AI_MINUTES', 'SMS', 'STORAGE'].includes(credit_type)) {
-      return res.status(400).json({ 
-        error: 'Invalid credit_type. Must be: AI_MINUTES, SMS, or STORAGE' 
+      return res.status(400).json({
+        error: 'Invalid credit_type. Must be: AI_MINUTES, SMS, or STORAGE'
       });
     }
 
     if (amount <= 0) {
-      return res.status(400).json({ 
-        error: 'Amount must be greater than 0' 
+      return res.status(400).json({
+        error: 'Amount must be greater than 0'
       });
     }
 
@@ -635,14 +655,14 @@ router.post('/users/:id/entitlements', authenticateAdmin, async (req, res) => {
 
     // Validation
     if (!override_type || !reason) {
-      return res.status(400).json({ 
-        error: 'Missing required fields: override_type, reason' 
+      return res.status(400).json({
+        error: 'Missing required fields: override_type, reason'
       });
     }
 
     if (!['PLAN', 'STATE', 'GRACE_PERIOD', 'QUOTAS'].includes(override_type)) {
-      return res.status(400).json({ 
-        error: 'Invalid override_type. Must be: PLAN, STATE, GRACE_PERIOD, or QUOTAS' 
+      return res.status(400).json({
+        error: 'Invalid override_type. Must be: PLAN, STATE, GRACE_PERIOD, or QUOTAS'
       });
     }
 
@@ -940,12 +960,12 @@ function convertToCSV(data) {
   return csvRows.join('\n');
 }
 
-module.exports = function(supabaseAdmin) {
+module.exports = function (supabaseAdmin) {
   // Middleware to attach supabaseAdmin to request
   router.use((req, res, next) => {
     req.supabaseAdmin = supabaseAdmin;
     next();
   });
-  
+
   return router;
 };
