@@ -963,6 +963,13 @@ function convertToCSV(data) {
 module.exports = function (supabaseAdmin) {
   // Middleware to attach supabaseAdmin to request
   router.use((req, res, next) => {
+    if (!supabaseAdmin) {
+      console.error('❌ FATAL: supabaseAdmin client is not initialized. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+      return res.status(500).json({ 
+        error: 'Server configuration error', 
+        detail: 'Supabase client not initialized' 
+      });
+    }
     req.supabaseAdmin = supabaseAdmin;
     next();
   });
