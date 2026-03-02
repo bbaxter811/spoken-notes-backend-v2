@@ -614,6 +614,7 @@ app.use(helmet({
 const allowedOrigins = [
   'https://admin.spokennotes.com',
   'https://admin-dashboard.spokennotes.com',
+  'https://spoken-notes-admin.vercel.app',
   process.env.ADMIN_DASHBOARD_URL,
   process.env.NODE_ENV === 'development' ? 'http://localhost:3000' : null,
   process.env.NODE_ENV === 'development' ? 'http://localhost:3001' : null,
