@@ -33,6 +33,9 @@ const { google } = require('googleapis');
 const app = express();
 const PORT = parseInt(process.env.PORT, 10) || 3000;
 
+// Trust proxy for rate limiting and IP detection (required for Render/Heroku/etc.)
+app.set('trust proxy', 1);
+
 // Initialize Stripe only if key is present (optional for deployment)
 let stripe = null;
 if (process.env.STRIPE_SECRET_KEY) {

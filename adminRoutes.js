@@ -6,127 +6,182 @@
 const express = require('express');
 const router = express.Router();
 
-// Module-scoped supabaseAdmin client (set by module.exports)
-let supabaseAdminClient = null;
-
 // ============================================================================
-// ADMIN AUTHENTICATION MIDDLEWARE
+// MODULE EXPORT - MUST WRAP EVERYTHING
 // ============================================================================
 
-/**
- * Admin authentication middleware
- * Checks if user is authenticated AND has admin privileges
- */
-async function authenticateAdmin(req, res, next) {
-  try {
-    // Check if supabaseAdmin is initialized
-    if (!supabaseAdminClient) {
-      console.error('❌ FATAL: supabaseAdmin not initialized in authenticateAdmin');
-      return res.status(500).json({ 
-        error: 'Server configuration error',
-        detail: 'Supabase client not available'
-      });
-    }
+module.exports = function adminRoutes(supabaseAdmin) {
+  // Fail-fast validation
+  if (!supabaseAdmin || !supabaseAdmin.auth) {
+    console.error('❌ FATAL: supabaseAdmin is invalid or missing');
+    throw new Error('Supabase admin client is required for admin routes');
+  }
 
-    // First, check if user is authenticated via Supabase
-    const authHeader = req.headers.authorization;
-    if (!authHeader || !authHeader.startsWith('Bearer ')) {
-      return res.status(401).json({ error: 'No authorization token provided' });
-    }
+  console.log('✅ Admin routes: Supabase client validated and attached');
 
-    const token = authHeader.substring(7);
-
-    // Verify token with Supabase
-    const { data: { user }, error } = await supabaseAdminClient.auth.getUser(token);
-
-    if (error || !user) {
-      console.error('❌ Admin auth failed - invalid token:', error);
-      return res.status(401).json({ error: 'Invalid token' });
-    }
-
-    console.log('[AUTH_ADMIN] JWT validated. userId=', user.id, 'email=', user.email);
-
-    // Check if user is an admin
-    console.log('[AUTH_ADMIN] Querying table=admin_users for userId=', user.id);
-    const { data: adminUser, error: adminError } = await supabaseAdminClient
-      .from('admin_users')
-      .select('*')
-      .eq('user_id', user.id)
-      .eq('is_active', true)
-      .single();
-
-    if (adminError) {
-      console.error('[AUTH_ADMIN] Supabase query error:', {
-        userId: user.id,
-        email: user.email,
-        table: 'admin_users',
-        errorCode: adminError.code,
-        errorMessage: adminError.message,
-        errorDetails: adminError.details,
-        errorHint: adminError.hint
-      });
-      return res.status(403).json({ 
-        error: 'Admin access denied', 
-        detail: adminError.message,
-        code: adminError.code
-      });
-    }
-
-    if (!adminUser) {
-      console.error('[AUTH_ADMIN] No admin record found for userId=', user.id, 'email=', user.email);
-      return res.status(403).json({ error: 'Access denied - not in admin allowlist' });
-    }
-
-    // Attach user and admin info to request
-    req.user = user;
-    req.admin = adminUser;
-
-    console.log(`✅ Admin authenticated: ${user.email} (${adminUser.admin_level})`);
-
+  // ============================================================================
+  // CRITICAL: Attach supabaseAdmin to EVERY request BEFORE any other middleware
+  // ============================================================================
+  
+  router.use((req, res, next) => {
+    req.supabaseAdmin = supabaseAdmin;
     next();
-  } catch (err) {
-    console.error('❌ Admin authentication error:', err);
-    res.status(500).json({ error: 'Authentication failed' });
-  }
-}
+  });
 
-// ============================================================================
-// ADMIN LOGGING HELPER
-// ============================================================================
+  // ============================================================================
+  // ADMIN AUTHENTICATION MIDDLEWARE
+  // ============================================================================
 
-/**
- * Log admin action to audit trail
- */
-async function logAdminAction(supabaseAdmin, adminUser, targetUserId, targetUserEmail, actionType, actionCategory, payload, beforeState, afterState, reason, ipAddress, userAgent) {
-  try {
-    const { data, error } = await supabaseAdmin.rpc('log_admin_action', {
-      p_admin_user_id: adminUser.user_id,
-      p_admin_email: adminUser.email,
-      p_target_user_id: targetUserId,
-      p_target_user_email: targetUserEmail,
-      p_action_type: actionType,
-      p_action_category: actionCategory,
-      p_payload_json: payload,
-      p_before_state: beforeState,
-      p_after_state: afterState,
-      p_reason: reason,
-      p_ip_address: ipAddress,
-      p_user_agent: userAgent
-    });
+  /**
+   * Admin authentication middleware
+   * Checks if user is authenticated AND has admin privileges
+   */
+  async function authenticateAdmin(req, res, next) {
+    try {
+      // Check if supabaseAdmin is available
+      if (!req.supabaseAdmin) {
+        console.error('❌ FATAL: req.supabaseAdmin is undefined in authenticateAdmin');
+        return res.status(500).json({ 
+          error: 'Server configuration error',
+          detail: 'Supabase client not attached to request'
+        });
+      }
 
-    if (error) {
-      console.error('❌ Failed to log admin action:', error);
-    } else {
-      console.log(`✅ Admin action logged: ${actionType} by ${adminUser.email}`);
+      // First, check if user is authenticated via Supabase
+      const authHeader = req.headers.authorization;
+      if (!authHeader || !authHeader.startsWith('Bearer ')) {
+        return res.status(401).json({ error: 'No authorization token provided' });
+      }
+
+      const token = authHeader.substring(7);
+
+      // Verify token with Supabase
+      console.log('[AUTH_ADMIN] Validating JWT token...');
+      const { data: { user }, error } = await req.supabaseAdmin.auth.getUser(token);
+
+      if (error || !user) {
+        console.error('[AUTH_ADMIN] JWT validation failed:', error);
+        return res.status(401).json({ error: 'Invalid token' });
+      }
+
+      console.log('[AUTH_ADMIN] JWT validated. userId=', user.id, 'email=', user.email);
+
+      // Check if user is an admin
+      console.log('[AUTH_ADMIN] Querying table=admin_users for userId=', user.id);
+      const { data: adminUser, error: adminError } = await req.supabaseAdmin
+        .from('admin_users')
+        .select('*')
+        .eq('user_id', user.id)
+        .eq('is_active', true)
+        .single();
+
+      if (adminError) {
+        console.error('[AUTH_ADMIN] Supabase query error:', {
+          userId: user.id,
+          email: user.email,
+          table: 'admin_users',
+          errorCode: adminError.code,
+          errorMessage: adminError.message,
+          errorDetails: adminError.details,
+          errorHint: adminError.hint
+        });
+        return res.status(403).json({ 
+          error: 'Admin access denied', 
+          detail: adminError.message,
+          code: adminError.code
+        });
+      }
+
+      if (!adminUser) {
+        console.error('[AUTH_ADMIN] No admin record found for userId=', user.id, 'email=', user.email);
+        return res.status(403).json({ error: 'Access denied - not in admin allowlist' });
+      }
+
+      // Attach user and admin info to request
+      req.user = user;
+      req.admin = adminUser;
+
+      console.log(`✅ Admin authenticated: ${user.email} (${adminUser.admin_level})`);
+
+      next();
+    } catch (err) {
+      console.error('❌ Admin authentication error:', err);
+      return res.status(500).json({ 
+        error: 'Authentication failed', 
+        detail: String(err?.message || err)
+      });
     }
-  } catch (err) {
-    console.error('❌ Admin logging error:', err);
   }
-}
 
-// ============================================================================
-// HEALTH CHECK ENDPOINT (NO AUTH REQUIRED)
-// ============================================================================
+  // ============================================================================
+  // ADMIN LOGGING HELPER
+  // ============================================================================
+
+  /**
+   * Log admin action to audit trail
+   */
+  async function logAdminAction(supabaseAdminClient, adminUser, targetUserId, targetUserEmail, actionType, actionCategory, payload, beforeState, afterState, reason, ipAddress, userAgent) {
+    try {
+      const { data, error } = await supabaseAdminClient.rpc('log_admin_action', {
+        p_admin_user_id: adminUser.user_id,
+        p_admin_email: adminUser.email,
+        p_target_user_id: targetUserId,
+        p_target_user_email: targetUserEmail,
+        p_action_type: actionType,
+        p_action_category: actionCategory,
+        p_payload_json: payload,
+        p_before_state: beforeState,
+        p_after_state: afterState,
+        p_reason: reason,
+        p_ip_address: ipAddress,
+        p_user_agent: userAgent
+      });
+
+      if (error) {
+        console.error('❌ Failed to log admin action:', error);
+      } else {
+        console.log(`✅ Admin action logged: ${actionType} by ${adminUser.email}`);
+      }
+    } catch (err) {
+      console.error('❌ Admin logging error:', err);
+    }
+  }
+
+  // ============================================================================
+  // HELPER FUNCTIONS
+  // ============================================================================
+
+  /**
+   * Convert array of objects to CSV
+   */
+  function convertToCSV(data) {
+    if (!data || data.length === 0) return '';
+
+    const headers = Object.keys(data[0]);
+    const csvRows = [];
+
+    // Add header row
+    csvRows.push(headers.join(','));
+
+    // Add data rows
+    for (const row of data) {
+      const values = headers.map(header => {
+        const val = row[header];
+        // Escape commas and quotes
+        if (typeof val === 'object') {
+          return `"${JSON.stringify(val).replace(/"/g, '""')}"`;
+        }
+        return `"${String(val).replace(/"/g, '""')}"`;
+      });
+      csvRows.push(values.join(','));
+    }
+
+    return csvRows.join('\n');
+  }
+
+  // ============================================================================
+  // HEALTH CHECK ENDPOINT (NO AUTH REQUIRED)
+  // ============================================================================
 
 /**
  * GET /admin/health
@@ -940,55 +995,11 @@ router.get('/actions/export', authenticateAdmin, async (req, res) => {
   }
 });
 
-// ============================================================================
-// HELPER FUNCTIONS
-// ============================================================================
-
-/**
- * Convert array of objects to CSV
- */
-function convertToCSV(data) {
-  if (!data || data.length === 0) return '';
-
-  const headers = Object.keys(data[0]);
-  const csvRows = [];
-
-  // Add header row
-  csvRows.push(headers.join(','));
-
-  // Add data rows
-  for (const row of data) {
-    const values = headers.map(header => {
-      const val = row[header];
-      // Escape commas and quotes
-      if (typeof val === 'object') {
-        return `"${JSON.stringify(val).replace(/"/g, '""')}"`;
-      }
-      return `"${String(val).replace(/"/g, '""')}"`;
-    });
-    csvRows.push(values.join(','));
-  }
-
-  return csvRows.join('\n');
-}
-
-module.exports = function (supabaseAdmin) {
-  // Set module-scoped supabaseAdmin client
-  supabaseAdminClient = supabaseAdmin;
-
-  // Fail-fast if not initialized
-  if (!supabaseAdminClient) {
-    console.error('❌ FATAL: supabaseAdmin client is not initialized. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
-    throw new Error('Supabase client not initialized - cannot mount admin routes');
-  }
-
-  console.log('✅ Admin routes: supabaseAdmin client attached');
-
-  // Attach supabaseAdmin to request for route handlers
-  router.use((req, res, next) => {
-    req.supabaseAdmin = supabaseAdminClient;
-    next();
-  });
-
+  // ============================================================================
+  // Return the configured router
+  // ============================================================================
+  
+  console.log('✅ Admin routes: All routes registered successfully');
   return router;
 };
+// End of module.exports
