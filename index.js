@@ -431,15 +431,36 @@ app.use(express.json());
 let supabaseAdmin;
 let openai;
 
+// CRITICAL: Fail-fast if Supabase credentials are missing
+if (!process.env.SUPABASE_URL || !process.env.SUPABASE_SERVICE_ROLE_KEY) {
+  console.error('❌ FATAL: Missing required Supabase environment variables');
+  console.error('   SUPABASE_URL:', process.env.SUPABASE_URL ? '✓ Set' : '✗ Missing');
+  console.error('   SUPABASE_SERVICE_ROLE_KEY:', process.env.SUPABASE_SERVICE_ROLE_KEY ? '✓ Set' : '✗ Missing');
+  console.error('🛑 Server cannot start without Supabase configuration. Exiting...');
+  process.exit(1);
+}
+
 try {
   supabaseAdmin = createClient(
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
   );
+  
+  // Verify client was actually created
+  if (!supabaseAdmin || !supabaseAdmin.auth) {
+    throw new Error('Supabase client creation returned invalid object');
+  }
+  
+  console.log('[BOOT] supabaseAdmin initialized: true');
   console.log('✅ Supabase client initialized');
-  console.log(`📍 Supabase URL: ${process.env.SUPABASE_URL}`); // Log URL for verification
+  console.log(`📍 Supabase URL: ${process.env.SUPABASE_URL}`);
 } catch (err) {
-  console.error('⚠️  Supabase initialization warning:', err.message);
+  console.error('[BOOT] supabaseAdmin initialized: false');
+  console.error('❌ FATAL: Supabase client initialization failed:', err.message);
+  console.error('   This is a critical error. Server cannot operate without Supabase.');
+  console.error('   Check your SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+  console.error('🛑 Exiting...');
+  process.exit(1);
 }
 
 // Initialize OpenAI client
