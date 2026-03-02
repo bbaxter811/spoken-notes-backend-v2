@@ -6,6 +6,9 @@
 const express = require('express');
 const router = express.Router();
 
+// Module-scoped supabaseAdmin client (set by module.exports)
+let supabaseAdminClient = null;
+
 // ============================================================================
 // ADMIN AUTHENTICATION MIDDLEWARE
 // ============================================================================
@@ -16,6 +19,15 @@ const router = express.Router();
  */
 async function authenticateAdmin(req, res, next) {
   try {
+    // Check if supabaseAdmin is initialized
+    if (!supabaseAdminClient) {
+      console.error('❌ FATAL: supabaseAdmin not initialized in authenticateAdmin');
+      return res.status(500).json({ 
+        error: 'Server configuration error',
+        detail: 'Supabase client not available'
+      });
+    }
+
     // First, check if user is authenticated via Supabase
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
@@ -25,7 +37,7 @@ async function authenticateAdmin(req, res, next) {
     const token = authHeader.substring(7);
 
     // Verify token with Supabase
-    const { data: { user }, error } = await req.supabaseAdmin.auth.getUser(token);
+    const { data: { user }, error } = await supabaseAdminClient.auth.getUser(token);
 
     if (error || !user) {
       console.error('❌ Admin auth failed - invalid token:', error);
@@ -36,7 +48,7 @@ async function authenticateAdmin(req, res, next) {
 
     // Check if user is an admin
     console.log('[AUTH_ADMIN] Querying table=admin_users for userId=', user.id);
-    const { data: adminUser, error: adminError } = await req.supabaseAdmin
+    const { data: adminUser, error: adminError } = await supabaseAdminClient
       .from('admin_users')
       .select('*')
       .eq('user_id', user.id)
@@ -961,16 +973,20 @@ function convertToCSV(data) {
 }
 
 module.exports = function (supabaseAdmin) {
-  // Middleware to attach supabaseAdmin to request
+  // Set module-scoped supabaseAdmin client
+  supabaseAdminClient = supabaseAdmin;
+
+  // Fail-fast if not initialized
+  if (!supabaseAdminClient) {
+    console.error('❌ FATAL: supabaseAdmin client is not initialized. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
+    throw new Error('Supabase client not initialized - cannot mount admin routes');
+  }
+
+  console.log('✅ Admin routes: supabaseAdmin client attached');
+
+  // Attach supabaseAdmin to request for route handlers
   router.use((req, res, next) => {
-    if (!supabaseAdmin) {
-      console.error('❌ FATAL: supabaseAdmin client is not initialized. Check SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY environment variables.');
-      return res.status(500).json({ 
-        error: 'Server configuration error', 
-        detail: 'Supabase client not initialized' 
-      });
-    }
-    req.supabaseAdmin = supabaseAdmin;
+    req.supabaseAdmin = supabaseAdminClient;
     next();
   });
 
