@@ -176,12 +176,12 @@ EXCEPTION
     -- Log error (Supabase logs will capture RAISE)
     RAISE WARNING 'reserve_ai_minutes failed for user %: %', p_user_id, SQLERRM;
     
-    -- FAIL-OPEN: Return allowed=true to prevent service disruption
-    -- Change to allowed=false for FAIL-CLOSED (stricter, worse UX)
+    -- FAIL-CLOSED: Return allowed=false to prevent billing exposure
+    -- This blocks requests when quota check fails (safer for revenue protection)
     RETURN JSONB_BUILD_OBJECT(
-      'allowed', true,
+      'allowed', false,
       'error', 'quota_reserve_failed',
-      'reason', 'Unable to verify AI quota - request allowed (error logged)'
+      'reason', 'Unable to verify AI quota - request blocked for billing safety'
     );
 END;
 $$ LANGUAGE plpgsql SECURITY DEFINER;
