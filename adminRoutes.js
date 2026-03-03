@@ -995,11 +995,347 @@ router.get('/actions/export', authenticateAdmin, async (req, res) => {
   }
 });
 
+// ============================================================================
+// PHASE 2: ANALYTICS & INSIGHTS ENDPOINTS
+// ============================================================================
+
+/**
+ * GET /admin/metrics/trends
+ * Trend analysis for specified metric over date range
+ * Query params: ?metric=dau|mrr|signups|churn&range=7d|30d|90d|1yr|custom&start_date=YYYY-MM-DD&end_date=YYYY-MM-DD
+ */
+router.get('/metrics/trends', authenticateAdmin, async (req, res) => {
+  try {
+    const { metric = 'dau', range = '30d', start_date, end_date } = req.query;
+
+    let startDate, endDate;
+    if (range === 'custom' && start_date && end_date) {
+      startDate = new Date(start_date);
+      endDate = new Date(end_date);
+    } else {
+      endDate = new Date();
+      const days = range === '7d' ? 7 : range === '30d' ? 30 : range === '90d' ? 90 : range === '1yr' ? 365 : 30;
+      startDate = new Date(endDate - days * 24 * 60 * 60 * 1000);
+    }
+
+    // Call database function for trend data
+    const { data, error } = await req.supabaseAdmin
+      .rpc('admin_get_metric_trends', {
+        p_metric: metric,
+        p_start_date: startDate.toISOString(),
+        p_end_date: endDate.toISOString()
+      });
+
+    if (error) {
+      console.error('❌ Trend query error:', error);
+      return res.status(500).json({ error: 'Failed to fetch trends', detail: error.message });
+    }
+
+    res.json({
+      success: true,
+      metric,
+      range,
+      start_date: startDate.toISOString(),
+      end_date: endDate.toISOString(),
+      data: data || []
+    });
+
+  } catch (err) {
+    console.error('❌ Trends endpoint error:', err);
+    res.status(500).json({ error: 'Failed to fetch trends' });
+  }
+});
+
+/**
+ * GET /admin/users/risk
+ * Churn prediction - identify users at risk of canceling
+ * Query params: ?threshold=high|medium|low&limit=50
+ */
+router.get('/users/risk', authenticateAdmin, async (req, res) => {
+  try {
+    const { threshold = 'high', limit = 50 } = req.query;
+
+    // Map threshold to score range
+    const minScore = threshold === 'high' ? 70 : threshold === 'medium' ? 40 : 0;
+
+    const { data, error } = await req.supabaseAdmin
+      .rpc('admin_get_churn_risk_users', {
+        p_min_risk_score: minScore,
+        p_limit: parseInt(limit)
+      });
+
+    if (error) {
+      console.error('❌ Churn risk query error:', error);
+      return res.status(500).json({ error: 'Failed to fetch risk users', detail: error.message });
+    }
+
+    res.json({
+      success: true,
+      threshold,
+      min_risk_score: minScore,
+      users: data || []
+    });
+
+  } catch (err) {
+    console.error('❌ Churn risk endpoint error:', err);
+    res.status(500).json({ error: 'Failed to fetch churn risk users' });
+  }
+});
+
+/**
+ * GET /admin/metrics/forecast
+ * Revenue forecasting for next N months
+ * Query params: ?months=3|6|12
+ */
+router.get('/metrics/forecast', authenticateAdmin, async (req, res) => {
+  try {
+    const { months = 6 } = req.query;
+
+    const { data, error } = await req.supabaseAdmin
+      .rpc('admin_get_revenue_forecast', {
+        p_months_ahead: parseInt(months)
+      });
+
+    if (error) {
+      console.error('❌ Forecast query error:', error);
+      return res.status(500).json({ error: 'Failed to generate forecast', detail: error.message });
+    }
+
+    res.json({
+      success: true,
+      months_ahead: parseInt(months),
+      forecast: data || []
+    });
+
+  } catch (err) {
+    console.error('❌ Forecast endpoint error:', err);
+    res.status(500).json({ error: 'Failed to generate revenue forecast' });
+  }
+});
+
+/**
+ * GET /admin/metrics/cohorts
+ * Cohort analysis - user behavior by signup period
+ * Query params: ?range=6m|1yr&granularity=week|month
+ */
+router.get('/metrics/cohorts', authenticateAdmin, async (req, res) => {
+  try {
+    const { range = '6m', granularity = 'month' } = req.query;
+
+    const months = range === '6m' ? 6 : range === '1yr' ? 12 : 6;
+
+    const { data, error } = await req.supabaseAdmin
+      .rpc('admin_get_cohort_analysis', {
+        p_months_back: months,
+        p_granularity: granularity
+      });
+
+    if (error) {
+      console.error('❌ Cohort query error:', error);
+      return res.status(500).json({ error: 'Failed to fetch cohort data', detail: error.message });
+    }
+
+    res.json({
+      success: true,
+      range,
+      granularity,
+      cohorts: data || []
+    });
+
+  } catch (err) {
+    console.error('❌ Cohort endpoint error:', err);
+    res.status(500).json({ error: 'Failed to fetch cohort analysis' });
+  }
+});
+
+/**
+ * GET /admin/alerts
+ * Anomaly detection - alerts for unusual metric deviations
+ * Query params: ?status=active|resolved|all&limit=20
+ */
+router.get('/alerts', authenticateAdmin, async (req, res) => {
+  try {
+    const { status = 'active', limit = 20 } = req.query;
+
+    // Get alerts from detection function
+    const { data, error } = await req.supabaseAdmin
+      .rpc('admin_detect_anomalies');
+
+    if (error) {
+      console.error('❌ Alerts query error:', error);
+      return res.status(500).json({ error: 'Failed to fetch alerts', detail: error.message });
+    }
+
+    // Filter by status if not 'all'
+    let alerts = data || [];
+    if (status !== 'all') {
+      alerts = alerts.filter(a => a.status === status);
+    }
+    alerts = alerts.slice(0, parseInt(limit));
+
+    res.json({
+      success: true,
+      status,
+      alerts
+    });
+
+  } catch (err) {
+    console.error('❌ Alerts endpoint error:', err);
+    res.status(500).json({ error: 'Failed to fetch alerts' });
+  }
+});
+
+/**
+ * GET /admin/users/segments
+ * User segmentation overview
+ */
+router.get('/users/segments', authenticateAdmin, async (req, res) => {
+  try {
+    const { data, error } = await req.supabaseAdmin
+      .from('admin_user_segments')
+      .select('*');
+
+    if (error) {
+      console.error('❌ Segments query error:', error);
+      return res.status(500).json({ error: 'Failed to fetch segments', detail: error.message });
+    }
+
+    res.json({
+      success: true,
+      segments: data || []
+    });
+
+  } catch (err) {
+    console.error('❌ Segments endpoint error:', err);
+    res.status(500).json({ error: 'Failed to fetch user segments' });
+  }
+});
+
+/**
+ * GET /admin/users/segment/:segment_name/export
+ * Export user emails from specific segment for campaigns
+ */
+router.get('/users/segment/:segment_name/export', authenticateAdmin, async (req, res) => {
+  try {
+    const { segment_name } = req.params;
+
+    const { data, error } = await req.supabaseAdmin
+      .rpc('admin_get_segment_users', {
+        p_segment_name: segment_name
+      });
+
+    if (error) {
+      console.error('❌ Segment export error:', error);
+      return res.status(500).json({ error: 'Failed to export segment', detail: error.message });
+    }
+
+    // Format as CSV
+    const csv = [
+      'email,user_id,created_at,subscription_tier',
+      ...(data || []).map(u => `${u.email},${u.user_id},${u.created_at},${u.subscription_tier}`)
+    ].join('\n');
+
+    res.setHeader('Content-Type', 'text/csv');
+    res.setHeader('Content-Disposition', `attachment; filename="segment_${segment_name}_${new Date().toISOString().split('T')[0]}.csv"`);
+    res.send(csv);
+
+    // Log action
+    await req.supabaseAdmin.rpc('admin_log_action',
+      [
+        req.adminUser.user_id,
+        req.user.email,
+        null,
+        null,
+        'EXPORT_SEGMENT',
+        'MARKETING',
+        { segment: segment_name, user_count: (data || []).length },
+        {},
+        {},
+        `Exported segment: ${segment_name}`,
+        req.ip,
+        req.headers['user-agent']
+      ]
+    );
+
+  } catch (err) {
+    console.error('❌ Segment export endpoint error:', err);
+    res.status(500).json({ error: 'Failed to export segment' });
+  }
+});
+
+/**
+ * GET /admin/metrics/:metric_name/compare
+ * Comparative benchmarking - compare metric to previous period
+ * Query params: ?compare_to=wow|mom|yoy|custom&current_start=YYYY-MM-DD&current_end=YYYY-MM-DD
+ */
+router.get('/metrics/:metric_name/compare', authenticateAdmin, async (req, res) => {
+  try {
+    const { metric_name } = req.params;
+    const { compare_to = 'mom', current_start, current_end } = req.query;
+
+    let currentStart, currentEnd, previousStart, previousEnd;
+
+    if (compare_to === 'custom' && current_start && current_end) {
+      currentStart = new Date(current_start);
+      currentEnd = new Date(current_end);
+      const duration = currentEnd - currentStart;
+      previousEnd = new Date(currentStart - 1);
+      previousStart = new Date(previousEnd - duration);
+    } else {
+      currentEnd = new Date();
+      if (compare_to === 'wow') {
+        currentStart = new Date(currentEnd - 7 * 24 * 60 * 60 * 1000);
+        previousEnd = new Date(currentStart - 1);
+        previousStart = new Date(currentStart - 7 * 24 * 60 * 60 * 1000);
+      } else if (compare_to === 'mom') {
+        currentStart = new Date(currentEnd);
+        currentStart.setMonth(currentStart.getMonth() - 1);
+        previousEnd = new Date(currentStart - 1);
+        previousStart = new Date(currentStart);
+        previousStart.setMonth(previousStart.getMonth() - 1);
+      } else if (compare_to === 'yoy') {
+        currentStart = new Date(currentEnd);
+        currentStart.setFullYear(currentStart.getFullYear() - 1);
+        previousEnd = new Date(currentStart - 1);
+        previousStart = new Date(currentStart);
+        previousStart.setFullYear(previousStart.getFullYear() - 1);
+      }
+    }
+
+    const { data, error } = await req.supabaseAdmin
+      .rpc('admin_compare_metric', {
+        p_metric_name: metric_name,
+        p_current_start: currentStart.toISOString(),
+        p_current_end: currentEnd.toISOString(),
+        p_previous_start: previousStart.toISOString(),
+        p_previous_end: previousEnd.toISOString()
+      });
+
+    if (error) {
+      console.error('❌ Comparison query error:', error);
+      return res.status(500).json({ error: 'Failed to compare metric', detail: error.message });
+    }
+
+    res.json({
+      success: true,
+      metric: metric_name,
+      compare_to,
+      current_period: { start: currentStart.toISOString(), end: currentEnd.toISOString() },
+      previous_period: { start: previousStart.toISOString(), end: previousEnd.toISOString() },
+      comparison: data || {}
+    });
+
+  } catch (err) {
+    console.error('❌ Comparison endpoint error:', err);
+    res.status(500).json({ error: 'Failed to compare metrics' });
+  }
+});
+
   // ============================================================================
   // Return the configured router
   // ============================================================================
   
-  console.log('✅ Admin routes: All routes registered successfully');
+  console.log('✅ Admin routes: All routes registered successfully (including Phase 2 analytics)');
   return router;
 };
 // End of module.exports
