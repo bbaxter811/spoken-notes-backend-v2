@@ -569,117 +569,18 @@ async function logAiUsage(userId, requestId, kind, usage) {
   }
 }
 
-/**
- * Check if user has sufficient AI minutes quota (ENFORCEMENT - P0)
- * ATOMICITY NOTE: This check + subsequent logAiUsage() are not in a single transaction.
- * Race condition window exists but is acceptable for MVP (worst case: 1-2 requests overage).
- * For high-scale: implement pessimistic locking or optimistic concurrency control.
- * 
- * @param {UUID} userId - User ID
- * @param {number} estimatedMinutes - AI minutes required for request
- * @returns {object} { allowed: boolean, used: number, limit: number, reason?: string }
- */
-async function checkAiMinutesQuota(userId, estimatedMinutes) {
-  try {
-    // 1. Get user's plan tier for limit calculation
-    const { data: subData } = await supabaseAdmin
-      .from('subscriptions')
-      .select('tier, status')
-      .eq('user_id', userId)
-      .maybeSingle();
-
-    const userTier = (subData?.status === 'active' || subData?.status === 'trialing')
-      ? (subData.tier || 'free')
-      : 'free';
-
-    // 2. Determine AI minutes limit by tier
-    let aiMinutesLimit;
-    switch (userTier) {
-      case 'pro':
-        aiMinutesLimit = 1000;
-        break;
-      case 'premium':
-        aiMinutesLimit = 5000; // Future tier
-        break;
-      case 'free':
-      default:
-        aiMinutesLimit = 10;
-    }
-
-    // 3. Check for active AI_MINUTES credits (consume credits BEFORE monthly quota)
-    const { data: credits } = await supabaseAdmin
-      .from('user_credits')
-      .select('remaining_amount')
-      .eq('user_id', userId)
-      .eq('credit_type', 'AI_MINUTES')
-      .eq('status', 'active')
-      .gt('remaining_amount', 0)
-      .order('expires_at', { ascending: true }) // FIFO by expiry
-      .limit(1);
-
-    if (credits && credits.length > 0) {
-      const creditBalance = parseFloat(credits[0].remaining_amount);
-      if (creditBalance >= estimatedMinutes) {
-        console.log(`✅ AI quota check: ALLOWED via credits (${creditBalance.toFixed(2)} min available)`);
-        return {
-          allowed: true,
-          via_credits: true,
-          credits_remaining: creditBalance
-        };
-      }
-      // Credits exist but insufficient - will check monthly quota
-      console.log(`⚠️ Insufficient credits (${creditBalance.toFixed(2)} < ${estimatedMinutes.toFixed(2)}), checking monthly quota`);
-    }
-
-    // 4. Check current month's usage (first day of month format: YYYY-MM-01)
-    const currentMonth = new Date();
-    currentMonth.setDate(1);
-    currentMonth.setHours(0, 0, 0, 0);
-    const monthKey = currentMonth.toISOString().split('T')[0]; // "2026-03-01"
-
-    const { data: monthlyUsage } = await supabaseAdmin
-      .from('user_ai_usage_monthly')
-      .select('ai_minutes_used')
-      .eq('user_id', userId)
-      .eq('month', monthKey)
-      .maybeSingle();
-
-    const aiMinutesUsed = parseFloat(monthlyUsage?.ai_minutes_used || 0);
-
-    // 5. Enforce quota limit
-    if (aiMinutesUsed + estimatedMinutes > aiMinutesLimit) {
-      console.log(`🚫 AI quota EXCEEDED: ${aiMinutesUsed.toFixed(2)}/${aiMinutesLimit} minutes (need ${estimatedMinutes.toFixed(2)} more)`);
-      return {
-        allowed: false,
-        used: aiMinutesUsed,
-        limit: aiMinutesLimit,
-        required: estimatedMinutes,
-        tier: userTier,
-        reason: `AI minutes limit reached`
-      };
-    }
-
-    // 6. Quota check PASSED
-    console.log(`✅ AI quota check: ALLOWED (${(aiMinutesUsed + estimatedMinutes).toFixed(2)}/${aiMinutesLimit} minutes after request)`);
-    return {
-      allowed: true,
-      used: aiMinutesUsed,
-      limit: aiMinutesLimit,
-      tier: userTier
-    };
-
-  } catch (err) {
-    console.error('❌ AI quota check error:', err);
-    // FAIL-OPEN: Allow request if quota check fails (prevents service disruption)
-    // Log error to Sentry/monitoring for investigation
-    // Alternative: FAIL-CLOSED (return { allowed: false }) for stricter enforcement
-    return {
-      allowed: true,
-      error: 'quota_check_failed',
-      reason: 'Unable to verify AI quota - request allowed (error logged)'
-    };
-  }
-}
+// ============================================================================
+// AI MINUTE QUOTA ENFORCEMENT
+// ============================================================================
+// AI minute limits are enforced exclusively via the reserve_ai_minutes() RPC
+// (defined in atomic_ai_quota_enforcement.sql). This provides:
+//   - Atomic quota checks with row-level locking (prevents race conditions)
+//   - Single source of truth for tier limits (Free: 10, Pro: 1000, Premium: 5000)
+//   - Admin quota overrides (entitlement_overrides.quota_overrides)
+//   - Credit consumption before monthly quota (FIFO by expiry)
+//
+// DO NOT implement quota checks in application code - use the database RPC.
+// ============================================================================
 
 // Initialize SendGrid for email sending
 if (process.env.SENDGRID_API_KEY) {

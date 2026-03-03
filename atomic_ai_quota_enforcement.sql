@@ -66,14 +66,27 @@ BEGIN
     v_tier := 'free';
   END IF;
 
-  -- 2. Determine AI minutes limit by tier
-  CASE v_tier
-    WHEN 'pro' THEN v_ai_limit := 1000;
-    WHEN 'premium' THEN v_ai_limit := 5000;
-    ELSE v_ai_limit := 10; -- free tier
-  END CASE;
+  -- 2. Check for active admin quota override (takes precedence over tier limits)
+  SELECT (eo.quota_overrides->>'ai_minutes_limit')::NUMERIC INTO v_ai_limit
+  FROM entitlement_overrides eo
+  WHERE eo.user_id = p_user_id
+    AND eo.override_type = 'QUOTAS'
+    AND eo.is_active = TRUE
+    AND eo.quota_overrides ? 'ai_minutes_limit'
+    AND (eo.expires_at IS NULL OR eo.expires_at > NOW())
+  ORDER BY eo.created_at DESC
+  LIMIT 1;
 
-  -- 3. Check for active AI_MINUTES credits (ATOMIC: lock credit row for update)
+  -- 3. If no admin override, determine AI minutes limit by tier
+  IF v_ai_limit IS NULL THEN
+    CASE v_tier
+      WHEN 'pro' THEN v_ai_limit := 1000;
+      WHEN 'premium' THEN v_ai_limit := 5000;
+      ELSE v_ai_limit := 10; -- free tier
+    END CASE;
+  END IF;
+
+  -- 4. Check for active AI_MINUTES credits (ATOMIC: lock credit row for update)
   SELECT remaining_amount INTO v_credit_balance
   FROM user_credits
   WHERE user_id = p_user_id
@@ -111,7 +124,7 @@ BEGIN
     END IF;
   END IF;
 
-  -- 4. No credits or insufficient credits → check monthly quota (ATOMIC: lock usage row)
+  -- 5. No credits or insufficient credits → check monthly quota (ATOMIC: lock usage row)
   -- Insert row if doesn't exist (first usage this month)
   INSERT INTO user_ai_usage_monthly (user_id, month, ai_minutes_used)
   VALUES (p_user_id, v_current_month, 0)
@@ -124,7 +137,7 @@ BEGIN
     AND month = v_current_month
   FOR UPDATE; -- CRITICAL: Prevents race conditions
 
-  -- 5. Enforce quota limit (within transaction, sees all committed + our pending changes)
+  -- 6. Enforce quota limit (within transaction, sees all committed + our pending changes)
   IF v_current_usage + p_minutes_to_reserve > v_ai_limit THEN
     -- Quota exceeded - return failure WITHOUT updating usage
     RETURN JSONB_BUILD_OBJECT(
@@ -137,14 +150,14 @@ BEGIN
     );
   END IF;
 
-  -- 6. Quota available - atomically increment usage
+  -- 7. Quota available - atomically increment usage
   UPDATE user_ai_usage_monthly
   SET ai_minutes_used = ai_minutes_used + p_minutes_to_reserve,
       updated_at = NOW()
   WHERE user_id = p_user_id
     AND month = v_current_month;
 
-  -- 7. Return success
+  -- 8. Return success
   RETURN JSONB_BUILD_OBJECT(
     'allowed', true,
     'via_credits', false,
