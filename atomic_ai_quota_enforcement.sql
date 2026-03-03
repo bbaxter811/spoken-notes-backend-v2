@@ -100,16 +100,21 @@ BEGIN
 
   -- If credits available and sufficient, consume credits (not monthly quota)
   IF v_credit_balance IS NOT NULL AND v_credit_balance >= p_minutes_to_reserve THEN
-    -- Decrement credit atomically
+    -- Decrement credit atomically (PostgreSQL UPDATE doesn't support ORDER BY/LIMIT, use subquery)
     UPDATE user_credits
     SET remaining_amount = remaining_amount - p_minutes_to_reserve,
         updated_at = NOW()
-    WHERE user_id = p_user_id
-      AND credit_type = 'AI_MINUTES'
-      AND status = 'active'
-      AND remaining_amount >= p_minutes_to_reserve
-    ORDER BY expires_at ASC NULLS LAST
-    LIMIT 1;
+    WHERE ctid = (
+      SELECT ctid
+      FROM user_credits
+      WHERE user_id = p_user_id
+        AND credit_type = 'AI_MINUTES'
+        AND status = 'active'
+        AND remaining_amount >= p_minutes_to_reserve
+        AND (expires_at IS NULL OR expires_at > NOW())
+      ORDER BY expires_at ASC NULLS LAST
+      LIMIT 1
+    );
 
     -- Check if update succeeded (credit had enough balance)
     IF FOUND THEN
