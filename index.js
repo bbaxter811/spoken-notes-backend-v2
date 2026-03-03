@@ -569,6 +569,118 @@ async function logAiUsage(userId, requestId, kind, usage) {
   }
 }
 
+/**
+ * Check if user has sufficient AI minutes quota (ENFORCEMENT - P0)
+ * ATOMICITY NOTE: This check + subsequent logAiUsage() are not in a single transaction.
+ * Race condition window exists but is acceptable for MVP (worst case: 1-2 requests overage).
+ * For high-scale: implement pessimistic locking or optimistic concurrency control.
+ * 
+ * @param {UUID} userId - User ID
+ * @param {number} estimatedMinutes - AI minutes required for request
+ * @returns {object} { allowed: boolean, used: number, limit: number, reason?: string }
+ */
+async function checkAiMinutesQuota(userId, estimatedMinutes) {
+  try {
+    // 1. Get user's plan tier for limit calculation
+    const { data: subData } = await supabaseAdmin
+      .from('subscriptions')
+      .select('tier, status')
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    const userTier = (subData?.status === 'active' || subData?.status === 'trialing') 
+      ? (subData.tier || 'free')
+      : 'free';
+
+    // 2. Determine AI minutes limit by tier
+    let aiMinutesLimit;
+    switch (userTier) {
+      case 'pro':
+        aiMinutesLimit = 1000;
+        break;
+      case 'premium':
+        aiMinutesLimit = 5000; // Future tier
+        break;
+      case 'free':
+      default:
+        aiMinutesLimit = 10;
+    }
+
+    // 3. Check for active AI_MINUTES credits (consume credits BEFORE monthly quota)
+    const { data: credits } = await supabaseAdmin
+      .from('user_credits')
+      .select('remaining_amount')
+      .eq('user_id', userId)
+      .eq('credit_type', 'AI_MINUTES')
+      .eq('status', 'active')
+      .gt('remaining_amount', 0)
+      .order('expires_at', { ascending: true }) // FIFO by expiry
+      .limit(1);
+
+    if (credits && credits.length > 0) {
+      const creditBalance = parseFloat(credits[0].remaining_amount);
+      if (creditBalance >= estimatedMinutes) {
+        console.log(`✅ AI quota check: ALLOWED via credits (${creditBalance.toFixed(2)} min available)`);
+        return { 
+          allowed: true, 
+          via_credits: true,
+          credits_remaining: creditBalance
+        };
+      }
+      // Credits exist but insufficient - will check monthly quota
+      console.log(`⚠️ Insufficient credits (${creditBalance.toFixed(2)} < ${estimatedMinutes.toFixed(2)}), checking monthly quota`);
+    }
+
+    // 4. Check current month's usage (first day of month format: YYYY-MM-01)
+    const currentMonth = new Date();
+    currentMonth.setDate(1);
+    currentMonth.setHours(0, 0, 0, 0);
+    const monthKey = currentMonth.toISOString().split('T')[0]; // "2026-03-01"
+    
+    const { data: monthlyUsage } = await supabaseAdmin
+      .from('user_ai_usage_monthly')
+      .select('ai_minutes_used')
+      .eq('user_id', userId)
+      .eq('month', monthKey)
+      .maybeSingle();
+
+    const aiMinutesUsed = parseFloat(monthlyUsage?.ai_minutes_used || 0);
+
+    // 5. Enforce quota limit
+    if (aiMinutesUsed + estimatedMinutes > aiMinutesLimit) {
+      console.log(`🚫 AI quota EXCEEDED: ${aiMinutesUsed.toFixed(2)}/${aiMinutesLimit} minutes (need ${estimatedMinutes.toFixed(2)} more)`);
+      return {
+        allowed: false,
+        used: aiMinutesUsed,
+        limit: aiMinutesLimit,
+        required: estimatedMinutes,
+        tier: userTier,
+        reason: `AI minutes limit reached`
+      };
+    }
+
+    // 6. Quota check PASSED
+    console.log(`✅ AI quota check: ALLOWED (${(aiMinutesUsed + estimatedMinutes).toFixed(2)}/${aiMinutesLimit} minutes after request)`);
+    return {
+      allowed: true,
+      used: aiMinutesUsed,
+      limit: aiMinutesLimit,
+      tier: userTier
+    };
+
+  } catch (err) {
+    console.error('❌ AI quota check error:', err);
+    // FAIL-OPEN: Allow request if quota check fails (prevents service disruption)
+    // Log error to Sentry/monitoring for investigation
+    // Alternative: FAIL-CLOSED (return { allowed: false }) for stricter enforcement
+    return { 
+      allowed: true, 
+      error: 'quota_check_failed',
+      reason: 'Unable to verify AI quota - request allowed (error logged)'
+    };
+  }
+}
+
 // Initialize SendGrid for email sending
 if (process.env.SENDGRID_API_KEY) {
   try {
@@ -934,7 +1046,26 @@ app.post('/api/test/smoke', async (req, res) => {
 
     } else if (testType === 'upload_check') {
       // Test 2: Simulate upload storage check (without actual file)
-      const { fileSize } = req.body;
+      c⚡ P0 FIX: AI MINUTES QUOTA ENFORCEMENT (pre-Whisper check)
+    // Voice commands are ~3 second snippets = 0.05 AI minutes
+    const estimatedAiMinutes = 3 / 60; // 0.05 minutes
+    const quotaCheck = await checkAiMinutesQuota(req.user.id, estimatedAiMinutes);
+
+    if (!quotaCheck.allowed) {
+      console.log(`🚫 Voice command BLOCKED: AI quota exceeded (${quotaCheck.used}/${quotaCheck.limit} minutes)`);
+      return res.status(402).json({
+        code: 'AI_LIMIT_EXCEEDED',
+        blocked_reason: 'AI_QUOTA_EXCEEDED',
+        message: 'AI minutes limit reached. Upgrade your plan to continue.',
+        ai_minutes_used: quotaCheck.used,
+        ai_minutes_limit: quotaCheck.limit,
+        ai_minutes_required: quotaCheck.required,
+        tier: quotaCheck.tier,
+        upgrade_required: true
+      });
+    }
+
+    // onst { fileSize } = req.body;
 
       if (!fileSize) {
         return res.status(400).json({ error: 'fileSize required for upload_check' });
@@ -1077,7 +1208,26 @@ app.post('/api/voice-command/transcribe', authenticateUser, upload.single('audio
   } catch (err) {
     console.error('❌ Voice command transcription error:', err);
     res.status(500).json({ error: 'Failed to transcribe voice command' });
-  }
+  }⚡ P0 FIX: AI MINUTES QUOTA ENFORCEMENT (pre-Whisper check)
+    // Check BEFORE storage upload to fail fast if quota exceeded
+    const estimatedAiMinutes = (parseInt(duration) || 0) / 60;
+    const quotaCheck = await checkAiMinutesQuota(userId, estimatedAiMinutes);
+
+    if (!quotaCheck.allowed) {
+      console.log(`🚫 Recording upload BLOCKED: AI quota exceeded (${quotaCheck.used}/${quotaCheck.limit} minutes)`);
+      return res.status(402).json({
+        code: 'AI_LIMIT_EXCEEDED',
+        blocked_reason: 'AI_QUOTA_EXCEEDED',
+        message: 'AI minutes limit reached. Upgrade your plan to continue.',
+        ai_minutes_used: quotaCheck.used,
+        ai_minutes_limit: quotaCheck.limit,
+        ai_minutes_required: quotaCheck.required,
+        tier: quotaCheck.tier,
+        upgrade_required: true
+      });
+    }
+
+    // 
 });
 
 /**
