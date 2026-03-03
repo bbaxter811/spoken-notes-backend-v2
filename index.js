@@ -448,12 +448,12 @@ try {
     process.env.SUPABASE_URL,
     process.env.SUPABASE_SERVICE_ROLE_KEY
   );
-  
+
   // Verify client was actually created
   if (!supabaseAdmin || !supabaseAdmin.auth) {
     throw new Error('Supabase client creation returned invalid object');
   }
-  
+
   console.log('[BOOT] supabaseAdmin initialized: true');
   console.log('✅ Supabase client initialized');
   console.log(`📍 Supabase URL: ${process.env.SUPABASE_URL}`);
@@ -588,7 +588,7 @@ async function checkAiMinutesQuota(userId, estimatedMinutes) {
       .eq('user_id', userId)
       .maybeSingle();
 
-    const userTier = (subData?.status === 'active' || subData?.status === 'trialing') 
+    const userTier = (subData?.status === 'active' || subData?.status === 'trialing')
       ? (subData.tier || 'free')
       : 'free';
 
@@ -621,8 +621,8 @@ async function checkAiMinutesQuota(userId, estimatedMinutes) {
       const creditBalance = parseFloat(credits[0].remaining_amount);
       if (creditBalance >= estimatedMinutes) {
         console.log(`✅ AI quota check: ALLOWED via credits (${creditBalance.toFixed(2)} min available)`);
-        return { 
-          allowed: true, 
+        return {
+          allowed: true,
           via_credits: true,
           credits_remaining: creditBalance
         };
@@ -636,7 +636,7 @@ async function checkAiMinutesQuota(userId, estimatedMinutes) {
     currentMonth.setDate(1);
     currentMonth.setHours(0, 0, 0, 0);
     const monthKey = currentMonth.toISOString().split('T')[0]; // "2026-03-01"
-    
+
     const { data: monthlyUsage } = await supabaseAdmin
       .from('user_ai_usage_monthly')
       .select('ai_minutes_used')
@@ -673,8 +673,8 @@ async function checkAiMinutesQuota(userId, estimatedMinutes) {
     // FAIL-OPEN: Allow request if quota check fails (prevents service disruption)
     // Log error to Sentry/monitoring for investigation
     // Alternative: FAIL-CLOSED (return { allowed: false }) for stricter enforcement
-    return { 
-      allowed: true, 
+    return {
+      allowed: true,
       error: 'quota_check_failed',
       reason: 'Unable to verify AI quota - request allowed (error logged)'
     };
@@ -1046,26 +1046,29 @@ app.post('/api/test/smoke', async (req, res) => {
 
     } else if (testType === 'upload_check') {
       // Test 2: Simulate upload storage check (without actual file)
-      c⚡ P0 FIX: AI MINUTES QUOTA ENFORCEMENT (pre-Whisper check)
-    // Voice commands are ~3 second snippets = 0.05 AI minutes
-    const estimatedAiMinutes = 3 / 60; // 0.05 minutes
-    const quotaCheck = await checkAiMinutesQuota(req.user.id, estimatedAiMinutes);
-
-    if (!quotaCheck.allowed) {
-      console.log(`🚫 Voice command BLOCKED: AI quota exceeded (${quotaCheck.used}/${quotaCheck.limit} minutes)`);
-      return res.status(402).json({
-        code: 'AI_LIMIT_EXCEEDED',
-        blocked_reason: 'AI_QUOTA_EXCEEDED',
-        message: 'AI minutes limit reached. Upgrade your plan to continue.',
-        ai_minutes_used: quotaCheck.used,
-        ai_minutes_limit: quotaCheck.limit,
-        ai_minutes_required: quotaCheck.required,
-        tier: quotaCheck.tier,
-        upgrade_required: true
+      // ⚡ P0 FIX: AI MINUTES QUOTA ENFORCEMENT (pre-Whisper check)
+      // Voice commands are ~3 second snippets = 0.05 AI minutes
+      const estimatedAiMinutes = 3 / 60; // 0.05 minutes
+      
+      const { data: reserve, error: reserveError } = await supabaseAdmin.rpc('reserve_ai_minutes', {
+        p_user_id: req.user.id,
+        p_minutes_to_reserve: estimatedAiMinutes
       });
-    }
 
-    // onst { fileSize } = req.body;
+      if (reserveError || !reserve.allowed) {
+        console.log(`🚫 AI quota test BLOCKED: ${reserve?.used || 0}/${reserve?.limit || 10} minutes`);
+        return res.status(402).json({
+          code: 'AI_LIMIT_EXCEEDED',
+          blocked_reason: 'AI_QUOTA_EXCEEDED',
+          message: 'AI minutes limit reached. Upgrade your plan to continue.',
+          ai_minutes_used: reserve?.used || 0,
+          ai_minutes_limit: reserve?.limit || 10,
+          tier: reserve?.tier || 'free',
+          upgrade_required: true
+        });
+      }
+
+      const { fileSize } = req.body;
 
       if (!fileSize) {
         return res.status(400).json({ error: 'fileSize required for upload_check' });
@@ -1177,6 +1180,30 @@ app.post('/api/voice-command/transcribe', authenticateUser, upload.single('audio
 
     console.log(`🎤 Voice command transcription request from user ${req.user.id}, size: ${req.file.size} bytes`);
 
+    // ⚡ P0 FIX: ATOMIC AI MINUTES QUOTA ENFORCEMENT
+    // Voice commands are ~3 second snippets = 0.05 AI minutes
+    const estimatedAiMinutes = 3 / 60; // 0.05 minutes
+    
+    const { data: reserve, error: reserveError } = await supabaseAdmin.rpc('reserve_ai_minutes', {
+      p_user_id: req.user.id,
+      p_minutes_to_reserve: estimatedAiMinutes
+    });
+
+    if (reserveError || !reserve.allowed) {
+      console.log(`🚫 Voice command BLOCKED: AI quota exceeded (${reserve?.used || 0}/${reserve?.limit || 10} minutes)`);
+      return res.status(402).json({
+        code: 'AI_LIMIT_EXCEEDED',
+        blocked_reason: 'AI_QUOTA_EXCEEDED',
+        message: 'AI minutes limit reached. Upgrade your plan to continue.',
+        ai_minutes_used: reserve?.used || 0,
+        ai_minutes_limit: reserve?.limit || 10,
+        tier: reserve?.tier || 'free',
+        upgrade_required: true
+      });
+    }
+
+    console.log(`✅ AI quota reserved: ${estimatedAiMinutes.toFixed(4)} minutes (${reserve.used}/${reserve.limit})`);
+
     // Create a File-like object for OpenAI API
     const audioFile = new File([req.file.buffer], req.file.originalname, {
       type: 'audio/wav'
@@ -1208,26 +1235,7 @@ app.post('/api/voice-command/transcribe', authenticateUser, upload.single('audio
   } catch (err) {
     console.error('❌ Voice command transcription error:', err);
     res.status(500).json({ error: 'Failed to transcribe voice command' });
-  }⚡ P0 FIX: AI MINUTES QUOTA ENFORCEMENT (pre-Whisper check)
-    // Check BEFORE storage upload to fail fast if quota exceeded
-    const estimatedAiMinutes = (parseInt(duration) || 0) / 60;
-    const quotaCheck = await checkAiMinutesQuota(userId, estimatedAiMinutes);
-
-    if (!quotaCheck.allowed) {
-      console.log(`🚫 Recording upload BLOCKED: AI quota exceeded (${quotaCheck.used}/${quotaCheck.limit} minutes)`);
-      return res.status(402).json({
-        code: 'AI_LIMIT_EXCEEDED',
-        blocked_reason: 'AI_QUOTA_EXCEEDED',
-        message: 'AI minutes limit reached. Upgrade your plan to continue.',
-        ai_minutes_used: quotaCheck.used,
-        ai_minutes_limit: quotaCheck.limit,
-        ai_minutes_required: quotaCheck.required,
-        tier: quotaCheck.tier,
-        upgrade_required: true
-      });
-    }
-
-    // 
+  }
 });
 
 /**
@@ -1245,6 +1253,30 @@ app.post('/api/recordings/upload', authenticateUser, upload.single('audio'), asy
     const recordingId = uuidv4();
 
     console.log(`📤 Uploading recording for user ${userId}, duration: ${duration}s, size: ${req.file.size} bytes`);
+
+    // ⚡ P0 FIX: ATOMIC AI MINUTES QUOTA ENFORCEMENT
+    // Check BEFORE storage upload to fail fast if quota exceeded
+    const estimatedAiMinutes = (parseInt(duration) || 0) / 60;
+    
+    const { data: reserve, error: reserveError } = await supabaseAdmin.rpc('reserve_ai_minutes', {
+      p_user_id: userId,
+      p_minutes_to_reserve: estimatedAiMinutes
+    });
+
+    if (reserveError || !reserve.allowed) {
+      console.log(`🚫 Recording upload BLOCKED: AI quota exceeded (${reserve?.used || 0}/${reserve?.limit || 10} minutes)`);
+      return res.status(402).json({
+        code: 'AI_LIMIT_EXCEEDED',
+        blocked_reason: 'AI_QUOTA_EXCEEDED',
+        message: 'AI minutes limit reached. Upgrade your plan to continue.',
+        ai_minutes_used: reserve?.used || 0,
+        ai_minutes_limit: reserve?.limit || 10,
+        tier: reserve?.tier || 'free',
+        upgrade_required: true
+      });
+    }
+
+    console.log(`✅ AI quota reserved: ${estimatedAiMinutes.toFixed(4)} minutes (${reserve.used}/${reserve.limit})`);
 
     // PHASE 3: Server-side storage limit enforcement (CRITICAL - fail-safe)
     // Active tiers: Free (100 MB) | Pro (5 GB)

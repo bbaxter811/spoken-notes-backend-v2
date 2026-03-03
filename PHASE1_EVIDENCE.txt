@@ -1,0 +1,60 @@
+﻿================================================================================
+PHASE 1 EVIDENCE PACK - Admin API Security Validation
+Generated: 2026-03-02 14:27:36 UTC
+Backend: https://spoken-notes-backend-v2.onrender.com
+Commit: 2c3016e (adminRoutes restructure + trust proxy)
+================================================================================
+
+TEST A: Health Check (No Auth Required)
+--------------------------------------------------------------------------------
+Status: 200 OK
+Response: {"status":"ok","service":"admin-routes","timestamp":"2026-03-02T19:27:36.261Z"}
+
+TEST B: Auth Enforcement (Expect 401 Without Token)
+--------------------------------------------------------------------------------
+Status: 401 (Expected)
+Message: Correctly rejected - no token provided
+
+TEST C: Metrics Overview with Valid JWT
+--------------------------------------------------------------------------------
+Status: 200 OK
+Response: {"success":true,"metrics":{"total_users":0,"active_users_7d":0,"new_signups_7d":0,"storage_used_gb":0,"generated_at":"2026-03-02T19:27:37.33227+00:00"}}
+
+TEST D: User Search with Valid JWT
+--------------------------------------------------------------------------------
+Status: 200 OK
+Users Found: 1
+First User:
+  - Email: bbaxter811@gmail.com
+  - User ID: 5b735e44-2f3a-40f5-b7fb-b2b4aef9c611
+  - Subscription Tier: free
+  - Created: 2025-12-28T16:41:55.71872+00:00
+
+TEST E: Rate Limiting (101 Requests to Trigger 429)
+--------------------------------------------------------------------------------
+Sending 101 requests to /admin/metrics/overview...
+
+Total Requests: 101
+Duration: 46.27 seconds
+
+Last 10 Status Codes:
+  Request #92 : 429
+  Request #93 : 429
+  Request #94 : 429
+  Request #95 : 429
+  Request #96 : 429
+  Request #97 : 429
+  Request #98 : 429
+  Request #99 : 429
+  Request #100 : 429
+  Request #101 : 429
+
+Summary:
+  - 200 OK: 87 requests
+  - 429 Too Many Requests: 14 requests
+
+âœ… Rate limiting is WORKING - 429 status codes detected after limit
+
+================================================================================
+END OF PHASE 1 EVIDENCE PACK
+================================================================================
